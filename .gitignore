@@ -1,3 +1,13 @@
+# Nix / direnv
+/.nix-pyenv
+/.direnv
+
+# Runtime data
+data/
+
+# Config (contains secrets)
+bot_cfg.py
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
