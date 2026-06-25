@@ -24,15 +24,13 @@ from modules.tri_lug_utils.bridge_message import (
     BridgeMessage,
     BridgeUser,
 )
+from modules.tri_lug_utils.header import render_header
 
 if TYPE_CHECKING:
     from telegram import Message, Update, User
     from telegram.ext import Application
 
 _LOGGER = get_logger(__name__)
-
-# How messages from other platforms are labelled when rendered into Telegram.
-_PLATFORM_LABEL = {"qq": "QQ", "matrix": "Matrix", "tg": "TG"}
 
 # Telegram delivers an album as several Updates in quick succession; buffer them
 # this long and flush as one bridged message.
@@ -331,11 +329,8 @@ class TelegramAdapter(BaseAdapter):
             _LOGGER.warning("[tg.send] app not attached, dropping message")
             return None
         bot = self._app.bot
-        label = _PLATFORM_LABEL.get(msg.platform, msg.platform)
         reply_id = int(reply_to_native_id) if reply_to_native_id else None
-        caption = f"[{label}] {msg.sender.display_name}:" + (
-            f"\n{msg.text}" if msg.text else ""
-        )
+        caption = render_header(msg, TG) + (f"\n{msg.text}" if msg.text else "")
         images = [
             a
             for a in msg.attachments

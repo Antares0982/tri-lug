@@ -17,6 +17,7 @@ our bot or a ghost (namespace prefix).
 
 from __future__ import annotations
 
+from html.parser import HTMLParser
 from typing import cast
 
 import aiohttp
@@ -26,6 +27,7 @@ from mautrix.types import (
     ContentURI,
     EventID,
     EventType,
+    Format,
     ImageInfo,
     MediaMessageEventContent,
     MessageEvent,
@@ -52,6 +54,61 @@ _LOGGER = get_logger(__name__)
 
 # Suffix on ghost display names so identical names across platforms stay distinct.
 _PLATFORM_LABEL = {"tg": "TG", "qq": "QQ", "matrix": "Matrix"}
+
+
+class _HtmlToText(HTMLParser):
+    """Flatten a Matrix `formatted_body` (org.matrix.custom.html) to plain text,
+    rewriting `<a href="url">text</a>` hyperlinks to `[text](url)`.
+
+    The plain-text `body` fallback keeps only a link's display text and drops the
+    URL, so for a message whose display text ≠ URL we must read the HTML to
+    recover the target. The output `[text](url)` matches the form a user gets by
+    typing markdown directly, which the QQ side already renders fine. Non-anchor
+    tags are dropped (text kept); `<br>` and block boundaries become newlines.
+    """
+
+    _BLOCK_TAGS = {"p", "div", "blockquote", "li", "tr", "h1", "h2", "h3"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._parts: list[str] = []
+        self._href: str | None = None
+        self._link: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag == "a":
+            self._href = dict(attrs).get("href")
+            self._link = []
+        elif tag == "br":
+            self._parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "a":
+            text = "".join(self._link)
+            href = self._href
+            self._href = None
+            self._link = []
+            # A bare autolink (text == href) is already self-describing; only
+            # the display-text ≠ URL case needs the markdown form.
+            if href and text and text != href:
+                self._parts.append(f"[{text}]({href})")
+            else:
+                self._parts.append(text or href or "")
+        elif tag in self._BLOCK_TAGS:
+            self._parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        (self._link if self._href is not None else self._parts).append(data)
+
+    def get_text(self) -> str:
+        return "".join(self._parts).strip()
+
+
+def flatten_matrix_html(formatted_body: str) -> str:
+    parser = _HtmlToText()
+    parser.feed(formatted_body)
+    parser.close()
+    return parser.get_text()
 
 
 class MatrixAdapter(BaseAdapter):
@@ -258,7 +315,24 @@ class MatrixAdapter(BaseAdapter):
                 )
             )
         else:
-            text = str(cast(TextMessageEventContent, content).body or "")
+            tmc = cast(TextMessageEventContent, content)
+            if tmc.format == Format.HTML and tmc.formatted_body:
+                # Strip the reply fallback (`<mx-reply>` / `> quoted` lines) so
+                # only the actual message HTML is flattened, then recover any
+                # `<a href>` hyperlinks the plain body would have dropped.
+                tmc.trim_reply_fallback()
+                text = flatten_matrix_html(tmc.formatted_body)
+                # TEMP diagnostic (warning level so it shows under prod logging):
+                # confirms which inbound shape we got and how it flattened. Drop
+                # once the formatted-link path is verified live.
+                _LOGGER.warning(
+                    "[matrix] formatted text: body=%r formatted_body=%r -> %r",
+                    tmc.body,
+                    tmc.formatted_body,
+                    text,
+                )
+            else:
+                text = str(tmc.body or "")
 
         if not text and not attachments:
             return

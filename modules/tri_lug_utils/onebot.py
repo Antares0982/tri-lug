@@ -20,9 +20,7 @@ from modules.tri_lug_utils.bridge_message import (
     BridgeMessage,
     BridgeUser,
 )
-
-# Prefix label for messages rendered into QQ (single bot account, no puppeting).
-_PLATFORM_LABEL = {"tg": "TG", "matrix": "Matrix", "qq": "QQ"}
+from modules.tri_lug_utils.header import render_header
 
 
 def parse_group_event(
@@ -165,8 +163,7 @@ def build_send_segments(
     if reply_to_native_id:
         segments.append({"type": "reply", "data": {"id": str(reply_to_native_id)}})
 
-    label = _PLATFORM_LABEL.get(msg.platform, msg.platform)
-    header = f"[{label}] {msg.sender.display_name}:"
+    header = render_header(msg, QQ)
     body = f"{header}\n{msg.text}" if msg.text else header
     segments.append({"type": "text", "data": {"text": body}})
 
