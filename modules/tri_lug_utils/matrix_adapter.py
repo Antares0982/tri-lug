@@ -365,15 +365,6 @@ class MatrixAdapter(BaseAdapter):
         if content.format == Format.HTML and content.formatted_body:
             content.trim_reply_fallback()
             text = flatten_matrix_html(content.formatted_body)
-            # TEMP diagnostic (warning level so it shows under prod logging):
-            # confirms which inbound shape we got and how it flattened. Drop
-            # once the formatted-text/caption path is verified live.
-            _LOGGER.warning(
-                "[matrix] formatted text: body=%r formatted_body=%r -> %r",
-                content.body,
-                content.formatted_body,
-                text,
-            )
             return text
         return str(content.body or "")
 

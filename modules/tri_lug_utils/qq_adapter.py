@@ -100,7 +100,7 @@ class QQAdapter(BaseAdapter):
         if bm is None:
             # In-scope group event with nothing we bridge (video/file/card/poke/
             # recall/...). Record it, clearly marked, and drop it.
-            _LOGGER.info("[QQ][log-only · not forwarded] %s", describe_event(event))
+            _LOGGER.warning("[QQ][log-only · not forwarded] %s", describe_event(event))
             return
         # A bare /stop_bridge or /start_bridge toggles the runtime pause instead
         # of being bridged. Checked before delivery so /start_bridge works while
