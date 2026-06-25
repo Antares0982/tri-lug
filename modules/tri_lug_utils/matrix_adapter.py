@@ -88,12 +88,15 @@ class _HtmlToText(HTMLParser):
             href = self._href
             self._href = None
             self._link = []
-            # A bare autolink (text == href) is already self-describing; only
-            # the display-text ≠ URL case needs the markdown form.
-            if href and text and text != href:
+            # matrix.to links are user/room pills (mentions); keep just the
+            # display text. A bare autolink (text == href) is already
+            # self-describing; only display-text ≠ URL needs the markdown form.
+            if not href or text == href or href.startswith("https://matrix.to/"):
+                self._parts.append(text or href or "")
+            elif text:
                 self._parts.append(f"[{text}]({href})")
             else:
-                self._parts.append(text or href or "")
+                self._parts.append(href)
         elif tag in self._BLOCK_TAGS:
             self._parts.append("\n")
 
