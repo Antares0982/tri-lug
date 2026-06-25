@@ -2,7 +2,9 @@
 
 An adapter owns one platform's side of one logical room. It:
   * translates inbound platform events into BridgeMessage and calls `_emit`,
-  * renders an outbound BridgeMessage via `send`, returning the new native id.
+  * renders an outbound BridgeMessage via `send`, returning every native id it
+    produced (a single source message can fan out into several native messages,
+    e.g. a text + image split, and each must be linked for reply resolution).
 
 Loop prevention lives in each adapter: it must drop messages authored by its
 own bridge identity *before* emitting, otherwise the message we just posted
@@ -43,10 +45,11 @@ class BaseAdapter(abc.ABC):
     @abc.abstractmethod
     async def send(
         self, msg: BridgeMessage, reply_to_native_id: str | None
-    ) -> str | None:
+    ) -> list[str]:
         """Render `msg` into this platform. `reply_to_native_id` is this
         platform's native id to reply to (already resolved by the Router), or
-        None. Returns the native id of the sent message, or None on failure."""
+        None. Returns the native ids of every message produced (in order, the
+        first being the reply anchor), or an empty list on failure / no-op."""
 
     async def set_pin(self, native_id: str, pinned: bool) -> None:
         """Pin (or unpin) `native_id` — this platform's native id, already
@@ -77,7 +80,7 @@ class MockAdapter(BaseAdapter):
 
     async def send(
         self, msg: BridgeMessage, reply_to_native_id: str | None
-    ) -> str | None:
+    ) -> list[str]:
         self._counter += 1
         native_id = f"{self.platform}-out-{self._counter}"
         reply_note = f" (reply→{reply_to_native_id})" if reply_to_native_id else ""
@@ -98,7 +101,7 @@ class MockAdapter(BaseAdapter):
             attach_note,
         )
         self.sent.append((native_id, msg, reply_to_native_id))
-        return native_id
+        return [native_id]
 
     async def simulate_incoming(
         self,

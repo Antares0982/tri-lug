@@ -324,10 +324,10 @@ class TelegramAdapter(BaseAdapter):
     # ----------------------------------------------------------------- outbound
     async def send(
         self, msg: BridgeMessage, reply_to_native_id: str | None
-    ) -> str | None:
+    ) -> list[str]:
         if self._app is None:
             _LOGGER.warning("[tg.send] app not attached, dropping message")
-            return None
+            return []
         bot = self._app.bot
         reply_id = int(reply_to_native_id) if reply_to_native_id else None
         caption = render_header(msg, TG) + (f"\n{msg.text}" if msg.text else "")
@@ -341,7 +341,7 @@ class TelegramAdapter(BaseAdapter):
             sent = await bot.send_message(
                 chat_id=self.chat_id, text=caption, reply_to_message_id=reply_id
             )
-            return str(sent.message_id)
+            return [str(sent.message_id)]
 
         if len(images) == 1:
             sent = await bot.send_photo(
@@ -350,11 +350,12 @@ class TelegramAdapter(BaseAdapter):
                 caption=caption,
                 reply_to_message_id=reply_id,
             )
-            return str(sent.message_id)
+            return [str(sent.message_id)]
 
         # Multiple images -> media-group album(s); caption on the first item.
-        # The first batch carries the reply + caption and provides the primary id.
-        primary: str | None = None
+        # The first batch carries the reply + caption; every produced id is
+        # returned (in order, first = reply anchor) so each is linked.
+        ids: list[str] = []
         for batch_start in range(0, len(images), _MEDIA_GROUP_MAX):
             batch = images[batch_start : batch_start + _MEDIA_GROUP_MAX]
             media = [
@@ -369,6 +370,5 @@ class TelegramAdapter(BaseAdapter):
                 media=media,
                 reply_to_message_id=reply_id if batch_start == 0 else None,
             )
-            if primary is None and sent_msgs:
-                primary = str(sent_msgs[0].message_id)
-        return primary
+            ids.extend(str(m.message_id) for m in sent_msgs)
+        return ids

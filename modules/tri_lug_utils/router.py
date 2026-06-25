@@ -264,8 +264,12 @@ class Router:
             reply_native = await self._idmap.native_id_for(
                 msg.platform, msg.reply_to_msg_id, adapter.platform
             )
-        native_id = await adapter.send(msg, reply_native)
-        if native_id is not None:
+        # A single source message can fan out into several native messages on
+        # the target (e.g. a text event + an image event on Matrix). Link every
+        # one to the same logical message — pairing each with the origin id,
+        # whose row already seeds the group — so a reply to any of them resolves.
+        native_ids = await adapter.send(msg, reply_native)
+        for native_id in native_ids:
             await self._idmap.link(
                 {msg.platform: msg.msg_id, adapter.platform: native_id}
             )

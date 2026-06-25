@@ -182,13 +182,13 @@ class QQAdapter(BaseAdapter):
 
     async def send(
         self, msg: BridgeMessage, reply_to_native_id: str | None
-    ) -> str | None:
+    ) -> list[str]:
         segments = build_send_segments(msg, reply_to_native_id)
         resp = await self.transport.call_action(
             "send_group_msg", {"group_id": self.group_id, "message": segments}
         )
         if not resp:
             _LOGGER.warning("[qq.send] no response / send failed")
-            return None
+            return []
         mid = resp.get("message_id")
-        return str(mid) if mid is not None else None
+        return [str(mid)] if mid is not None else []

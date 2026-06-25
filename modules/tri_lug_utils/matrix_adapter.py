@@ -47,6 +47,7 @@ from modules.tri_lug_utils.bridge_message import (
     Attachment,
     BridgeMessage,
     BridgeUser,
+    sniff_image_mime,
 )
 from modules.tri_lug_utils.router import STOP_COMMAND, parse_control_command
 
@@ -381,18 +382,21 @@ class MatrixAdapter(BaseAdapter):
     # ----------------------------------------------------------------- outbound
     async def send(
         self, msg: BridgeMessage, reply_to_native_id: str | None
-    ) -> str | None:
+    ) -> list[str]:
         if self._appserv is None:
-            return None
+            return []
         intent = await self._ghost_intent(msg.sender)
         reply_evt = EventID(reply_to_native_id) if reply_to_native_id else None
-        primary: str | None = None
+        # A text + image source message splits into a text event and an image
+        # event; both ids are returned so the Router links each one, otherwise a
+        # reply to the image event resolves to nothing.
+        event_ids: list[str] = []
 
         if msg.text:
             content = TextMessageEventContent(msgtype=MessageType.TEXT, body=msg.text)
             if reply_evt:
                 content.set_reply(reply_evt)
-            primary = str(await intent.send_message(self._room_id, content))
+            event_ids.append(str(await intent.send_message(self._room_id, content)))
 
         for att in msg.attachments:
             if att.kind != "image":
@@ -409,13 +413,11 @@ class MatrixAdapter(BaseAdapter):
                 url=mxc,
                 info=ImageInfo(mimetype=att.mime) if att.mime else None,
             )
-            if reply_evt and primary is None:
+            if reply_evt and not event_ids:
                 content.set_reply(reply_evt)
-            eid = str(await intent.send_message(self._room_id, content))
-            if primary is None:
-                primary = eid
+            event_ids.append(str(await intent.send_message(self._room_id, content)))
 
-        return primary
+        return event_ids
 
     async def _ghost_intent(self, sender: BridgeUser) -> IntentAPI:
         assert self._appserv is not None
@@ -461,7 +463,9 @@ class MatrixAdapter(BaseAdapter):
                 return  # key known but no bytes available — leave avatar as is
             try:
                 uploaded = await intent.upload_media(
-                    sender.avatar_data, filename="avatar"
+                    sender.avatar_data,
+                    mime_type=sniff_image_mime(sender.avatar_data),
+                    filename="avatar",
                 )
             except MatrixError:
                 _LOGGER.warning("[matrix] avatar upload failed for %s", localpart)

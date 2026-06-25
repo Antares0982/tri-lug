@@ -39,6 +39,27 @@ class BridgeUser:
     avatar_data: bytes | None = None
 
 
+def sniff_image_mime(data: bytes | None) -> str | None:
+    """Best-effort image MIME type from a payload's magic bytes.
+
+    Needed because a Matrix media upload sent without a ``Content-Type`` is
+    stored as ``application/octet-stream``, which clients refuse to render as an
+    avatar. mautrix only auto-detects the type when libmagic is installed (it is
+    not here), so we sniff the few image formats avatar sources actually return
+    (QQ qlogo serves PNG or JPEG, Telegram serves JPEG)."""
+    if not data:
+        return None
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
 @dataclass
 class Attachment:
     """A non-text payload. Stickers are normalized to `kind="image"` wherever a
