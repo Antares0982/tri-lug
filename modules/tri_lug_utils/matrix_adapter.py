@@ -309,30 +309,22 @@ class MatrixAdapter(BaseAdapter):
                 if media.info and getattr(media.info, "mimetype", None)
                 else None
             )
+            # MSC2530: a captioned image carries the real file name in
+            # `filename` and the caption in `body`/`formatted_body`; an
+            # uncaptioned one has no `filename` and `body` is the file name.
+            has_caption = bool(media.filename) and media.body != media.filename
             attachments.append(
                 Attachment(
-                    "image", data=data, mime=mime, filename=str(media.body or "image")
+                    "image",
+                    data=data,
+                    mime=mime,
+                    filename=str(media.filename or media.body or "image"),
                 )
             )
+            if has_caption:
+                text = self._content_text(media)
         else:
-            tmc = cast(TextMessageEventContent, content)
-            if tmc.format == Format.HTML and tmc.formatted_body:
-                # Strip the reply fallback (`<mx-reply>` / `> quoted` lines) so
-                # only the actual message HTML is flattened, then recover any
-                # `<a href>` hyperlinks the plain body would have dropped.
-                tmc.trim_reply_fallback()
-                text = flatten_matrix_html(tmc.formatted_body)
-                # TEMP diagnostic (warning level so it shows under prod logging):
-                # confirms which inbound shape we got and how it flattened. Drop
-                # once the formatted-link path is verified live.
-                _LOGGER.warning(
-                    "[matrix] formatted text: body=%r formatted_body=%r -> %r",
-                    tmc.body,
-                    tmc.formatted_body,
-                    text,
-                )
-            else:
-                text = str(tmc.body or "")
+            text = self._content_text(cast(TextMessageEventContent, content))
 
         if not text and not attachments:
             return
@@ -361,6 +353,26 @@ class MatrixAdapter(BaseAdapter):
             raw=evt,
         )
         await self._emit(bm)
+
+    def _content_text(self, content: TextMessageEventContent) -> str:
+        """Plain text of a text message or a media caption. When the content is
+        HTML-formatted, strip the reply fallback (`<mx-reply>` / `> quoted`) and
+        flatten the HTML — recovering `<a href>` hyperlinks the plain `body`
+        would have dropped — otherwise fall back to `body`."""
+        if content.format == Format.HTML and content.formatted_body:
+            content.trim_reply_fallback()
+            text = flatten_matrix_html(content.formatted_body)
+            # TEMP diagnostic (warning level so it shows under prod logging):
+            # confirms which inbound shape we got and how it flattened. Drop
+            # once the formatted-text/caption path is verified live.
+            _LOGGER.warning(
+                "[matrix] formatted text: body=%r formatted_body=%r -> %r",
+                content.body,
+                content.formatted_body,
+                text,
+            )
+            return text
+        return str(content.body or "")
 
     async def _displayname(self, user_id: UserID) -> str:
         assert self._appserv is not None
