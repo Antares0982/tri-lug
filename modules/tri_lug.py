@@ -17,7 +17,7 @@ from antares_bot.module_base import TelegramBotModuleBase
 
 from bot_cfg import TriLugConfig
 from modules.tri_lug_utils.adapters import MockAdapter
-from modules.tri_lug_utils.bridge_message import MATRIX, QQ
+from modules.tri_lug_utils.bridge_message import MATRIX, QQ, TG
 from modules.tri_lug_utils.idmap import IdMap
 from modules.tri_lug_utils.matrix_adapter import MatrixAdapter
 from modules.tri_lug_utils.qq_adapter import QQAdapter
@@ -27,9 +27,10 @@ from modules.tri_lug_utils.tg_adapter import TelegramAdapter
 
 if TYPE_CHECKING:
     from telegram import Update
-    from telegram.ext import Application
+    from telegram.ext import Application, BaseHandler
 
     from antares_bot.context import RichCallbackContext
+    from antares_bot.framework import CallbackBase
 
 _LOGGER = get_logger(__name__)
 
@@ -44,11 +45,21 @@ class TriLug(TelegramBotModuleBase):
         self._idmap = IdMap(cfg.DB_PATH)
         self._router = Router(self._idmap, dry_run=getattr(cfg, "DRY_RUN", False))
         self._purge_task: asyncio.Task | None = None
-        self._tg = TelegramAdapter(ROOM_KEY, cfg.TG_CHAT_ID)
+        self._tg_enabled = getattr(cfg, "TG_ENABLED", True)
+        self._tg = self._build_tg_adapter(cfg)
         self._qq = self._build_qq_adapter(cfg)
         self._matrix = self._build_matrix_adapter(cfg)
         for adapter in (self._tg, self._qq, self._matrix):
             self._router.register(adapter)
+
+    def _build_tg_adapter(self, cfg):
+        """Real TelegramAdapter when enabled, else a MockAdapter so the bridge's
+        TG side is detached: the bot still talks to Telegram for slash commands,
+        but no group message is bridged in (handler not registered) or out (the
+        mock only logs, never calls bot.send_*)."""
+        if not self._tg_enabled:
+            return MockAdapter(TG, ROOM_KEY)
+        return TelegramAdapter(ROOM_KEY, cfg.TG_CHAT_ID)
 
     def _build_qq_adapter(self, cfg):
         """Real QQAdapter (RabbitMQ → relay → NapCat) when configured, else a
@@ -93,7 +104,8 @@ class TriLug(TelegramBotModuleBase):
         if not self._enabled:
             _LOGGER.info("[tri_lug] disabled via config, not starting bridge")
             return
-        self._tg.attach_app(app)
+        if isinstance(self._tg, TelegramAdapter):
+            self._tg.attach_app(app)
         await self._idmap.open()
         for adapter in (self._tg, self._qq, self._matrix):
             await adapter.start()
@@ -101,7 +113,7 @@ class TriLug(TelegramBotModuleBase):
         self._purge_task = asyncio.create_task(self._purge_loop())
         _LOGGER.info(
             "[tri_lug] bridge started (tg=%s, qq=%s, matrix=%s, dry_run=%s)",
-            TriLugConfig.TG_CHAT_ID,
+            "real" if self._tg_enabled else "mock",
             "real" if getattr(TriLugConfig, "QQ_ENABLED", False) else "mock",
             "real" if getattr(TriLugConfig, "MATRIX_ENABLED", False) else "mock",
             getattr(TriLugConfig, "DRY_RUN", False),
@@ -124,15 +136,26 @@ class TriLug(TelegramBotModuleBase):
         if not self._enabled:
             return []
         # Command handlers first so a bare "/stop_bridge" is consumed as a
-        # command (one handler per group) instead of also being bridged.
-        return [
+        # command (one handler per group) instead of also being bridged. These
+        # are always registered — slash commands keep working even when the TG
+        # adapter is disabled.
+        handlers: list[CallbackBase | BaseHandler] = [
             command_callback_wrapper(self.stop_bridge),
             command_callback_wrapper(self.start_bridge),
-            msg_handle_wrapper(filters=self._tg.matches)(self._on_tg_message),
         ]
+        # The bridge message handler only when the TG adapter is live; when
+        # disabled there's no real adapter (hence no `matches`) and TG group
+        # messages should not be bridged at all.
+        if isinstance(self._tg, TelegramAdapter):
+            handlers.append(
+                msg_handle_wrapper(filters=self._tg.matches)(self._on_tg_message)
+            )
+        return handlers
 
     async def _on_tg_message(self, update: "Update", context: "RichCallbackContext"):
-        if not self._enabled:
+        # Registered only when the TG adapter is live (see mark_handlers), so the
+        # isinstance check also satisfies the type narrowing for on_update.
+        if not self._enabled or not isinstance(self._tg, TelegramAdapter):
             return
         await self._tg.on_update(update)
 
