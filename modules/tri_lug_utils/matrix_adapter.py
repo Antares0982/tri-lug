@@ -404,14 +404,13 @@ class MatrixAdapter(BaseAdapter):
             data = await self._attachment_bytes(att)
             if data is None:
                 continue
-            mxc = await intent.upload_media(
-                data, mime_type=att.mime, filename=att.filename
-            )
+            mime = att.mime or sniff_image_mime(data)
+            mxc = await intent.upload_media(data, mime_type=mime, filename=att.filename)
             content = MediaMessageEventContent(
                 msgtype=MessageType.IMAGE,
                 body=att.filename or "image",
                 url=mxc,
-                info=ImageInfo(mimetype=att.mime) if att.mime else None,
+                info=ImageInfo(mimetype=mime) if mime else None,
             )
             if reply_evt and not event_ids:
                 content.set_reply(reply_evt)
