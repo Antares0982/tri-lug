@@ -1,3 +1,6 @@
+# mautrix
+mx-state.json
+
 # Nix / direnv
 /.nix-pyenv
 /.direnv
