@@ -19,6 +19,7 @@ from modules.tri_lug_utils.bridge_message import (
     Attachment,
     BridgeMessage,
     BridgeUser,
+    sniff_image_mime,
 )
 from modules.tri_lug_utils.header import render_header
 
@@ -112,10 +113,11 @@ def _image_attachment(data: dict) -> Attachment | None:
         except ValueError:
             raw_bytes = b""
         if raw_bytes:
+            mime = data.get("mime") or sniff_image_mime(raw_bytes)
             return Attachment(
                 "image",
                 data=raw_bytes,
-                mime=data.get("mime"),
+                mime=mime,
                 filename=data.get("file"),
             )
     file_ref = data.get("url") or data.get("file")
