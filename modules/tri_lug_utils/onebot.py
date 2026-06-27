@@ -137,6 +137,29 @@ def _event_ts(event: dict) -> float:
     return time.time()
 
 
+def is_noise_event(event: dict) -> bool:
+    """Return True for QQ events that are pure noise and don't need logging.
+
+    Suppressed types:
+    - ``notice_type=group_msg_emoji_like``  (reaction notifications)
+    - messages whose only segments are ``face``  (small emoji, not bridgeable)
+    - ``sub_type=poke``  (poke / nudge notices)
+    """
+    post_type = event.get("post_type")
+    if post_type == "notice":
+        if event.get("notice_type") == "group_msg_emoji_like":
+            return True
+        if event.get("sub_type") == "poke":
+            return True
+    if post_type == "message":
+        segments = event.get("message")
+        if isinstance(segments, list) and segments:
+            seg_types = {s.get("type") for s in segments if isinstance(s, dict)}
+            if seg_types == {"face"}:
+                return True
+    return False
+
+
 def describe_event(event: dict) -> str:
     """One-line summary of a QQ event we do NOT bridge, for the log-only path."""
     post_type = event.get("post_type")

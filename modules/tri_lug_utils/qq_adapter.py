@@ -23,6 +23,7 @@ from modules.tri_lug_utils.bridge_message import QQ, BridgeMessage, BridgeUser
 from modules.tri_lug_utils.onebot import (
     build_send_segments,
     describe_event,
+    is_noise_event,
     parse_group_event,
 )
 from modules.tri_lug_utils.router import STOP_COMMAND, parse_control_command
@@ -99,8 +100,12 @@ class QQAdapter(BaseAdapter):
         bm = parse_group_event(event, self.room_key, self.self_uin, name_map)
         if bm is None:
             # In-scope group event with nothing we bridge (video/file/card/poke/
-            # recall/...). Record it, clearly marked, and drop it.
-            _LOGGER.warning("[QQ][log-only · not forwarded] %s", describe_event(event))
+            # recall/...). Drop it silently when it's a known noise type,
+            # otherwise record it clearly marked.
+            if not is_noise_event(event):
+                _LOGGER.warning(
+                    "[QQ][log-only · not forwarded] %s", describe_event(event)
+                )
             return
         # A bare /stop_bridge or /start_bridge toggles the runtime pause instead
         # of being bridged. Checked before delivery so /start_bridge works while
