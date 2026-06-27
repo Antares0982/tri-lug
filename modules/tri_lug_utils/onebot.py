@@ -147,7 +147,7 @@ def is_noise_event(event: dict) -> bool:
     """
     post_type = event.get("post_type")
     if post_type == "notice":
-        if event.get("notice_type") == "group_msg_emoji_like":
+        if event.get("notice_type") in ("group_msg_emoji_like", "group_recall"):
             return True
         if event.get("sub_type") == "poke":
             return True
