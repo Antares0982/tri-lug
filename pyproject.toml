@@ -1,0 +1,4 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]  # repo root on sys.path so `import modules.*` resolves
+asyncio_mode = "auto"  # async test_* run without per-test @pytest.mark.asyncio

@@ -19,15 +19,17 @@ python main.py       # run the bot (needs a populated bot_cfg.py + live broker/a
 
 `bot_cfg.py` holds all secrets and config (`TriLugConfig`, broker creds, Matrix tokens) and is **gitignored** — it exists locally but is never committed.
 
-Tests are **plain assert-based scripts, not pytest**, and are fully network-free (RabbitMQ/NapCat/Matrix/Telegram all stubbed, `asyncio.sleep` injected so the 3s pacing is asserted via recorded durations rather than real waiting). Run each from the repo root:
+Tests are **pytest**, assert-based, and fully network-free (RabbitMQ/NapCat/Matrix/Telegram all stubbed, `asyncio.sleep` injected so the 3s pacing is asserted via recorded durations rather than real waiting). Shared setup lives in `tests/conftest.py` (the `make_bridge`/`idmap`/`make_qq_transport` fixtures and the `FakeQQTransport` / event-builder helpers); `pyproject.toml` sets `asyncio_mode = "auto"` so `async def test_*` run without per-test markers. Run from the repo root:
 
 ```bash
-python -m tests.tri_lug_mock_demo           # Router + IdMap + MockAdapters spine
-python -m tests.tri_lug_qq_demo             # OneBot11 <-> BridgeMessage + QQAdapter
-python -m tests.tri_lug_qq_transport_demo   # RabbitMQ transport RPC/echo correlation
+pytest                                  # whole suite
+pytest tests/test_tri_lug_qq.py         # one file
+pytest tests/test_tri_lug_mock.py::test_pacing_gap   # one test
 ```
 
-Each prints `ALL ... CHECKS PASSED` on success; a failed `assert` is the failure signal.
+- `test_tri_lug_mock.py` — Router + IdMap + MockAdapters spine
+- `test_tri_lug_qq.py` — OneBot11 ⇄ BridgeMessage + QQAdapter
+- `test_tri_lug_qq_transport.py` — RabbitMQ transport RPC/echo correlation
 
 Lint with **ruff** (`ruff check` / `ruff format`; only the `.ruff_cache/` is checked in, no config file ⇒ defaults).
 
