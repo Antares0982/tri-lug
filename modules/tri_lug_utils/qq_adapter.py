@@ -14,8 +14,12 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import re
 import time
+from typing import Awaitable, Callable
+from urllib.parse import urlunsplit
 
+from antares_bot import utils
 from antares_bot.bot_logging import get_logger
 
 from modules.tri_lug_utils.adapters import BaseAdapter
@@ -36,6 +40,31 @@ _LOGGER = get_logger(__name__)
 _MEMBER_NAME_TTL = 300.0
 _AVATAR_TTL = 6 * 3600.0
 _AVATAR_NEG_TTL = 600.0
+
+# bilibili share cards carry a b23.tv short link; expand it to the canonical
+# long URL (the same one-redirect hop alice's bv_modifier does). A resolver is
+# `(short_url) -> long_url | None`; None means "leave the short link as-is".
+_B23_PATTERN = re.compile(r"https?://b23\.tv/[A-Za-z0-9]+")
+ShortLinkResolver = Callable[[str], Awaitable[str | None]]
+
+
+async def resolve_b23_short(short: str) -> str | None:
+    """Resolve a b23.tv short link to its long form by following the single
+    redirect, keeping scheme+host+path (dropping share-tracking query)."""
+    try:
+        resp = await utils.fetch_url(short, follow_redirects=False)
+        nxt = getattr(resp, "next_request", None)
+        if nxt is None:
+            return None
+        u = nxt.url
+        if not u.host:
+            return None
+        long_url = urlunsplit((u.scheme, u.host, u.path, "", ""))
+        _LOGGER.info("[qq] resolved %s -> %s", short, long_url)
+        return long_url
+    except Exception:
+        _LOGGER.warning("[qq] b23 resolve failed for %s", short, exc_info=True)
+        return None
 
 
 class QQTransport(abc.ABC):
@@ -70,11 +99,14 @@ class QQAdapter(BaseAdapter):
         group_id: int,
         self_uin: int,
         transport: "QQTransport",
+        link_resolver: "ShortLinkResolver | None" = None,
     ) -> None:
         super().__init__(room_key)
         self.group_id = group_id
         self.self_uin = self_uin
         self.transport = transport
+        # Injectable so tests stay network-free; defaults to the real b23 hop.
+        self._resolve_short = link_resolver or resolve_b23_short
         # uin -> (fetched_at, value) caches, so repeated messages from one member
         # don't re-hit NapCat (names) / the relay over RabbitMQ (avatars).
         self._member_names: dict[str, tuple[float, str]] = {}
@@ -116,8 +148,29 @@ class QQAdapter(BaseAdapter):
                 if self.router is not None:
                     self.router.set_paused(cmd == STOP_COMMAND)
                 return
+        if bm.text:
+            bm.text = await self._resolve_short_links(bm.text)
         await self._attach_avatar(bm.sender)
         await self._emit(bm)
+
+    async def _resolve_short_links(self, text: str) -> str:
+        """Expand every b23.tv short link in `text` to its long form. Used for
+        bilibili share cards (and any plain message that pastes one). A failed
+        resolve leaves that link untouched."""
+        matches = list(_B23_PATTERN.finditer(text))
+        if not matches:
+            return text
+        resolved = await asyncio.gather(
+            *(self._resolve_short(m.group()) for m in matches)
+        )
+        parts: list[str] = []
+        last = 0
+        for match, long_url in zip(matches, resolved):
+            parts.append(text[last : match.start()])
+            parts.append(long_url or match.group())
+            last = match.end()
+        parts.append(text[last:])
+        return "".join(parts)
 
     # --------------------------------------------------------- name / avatar
     async def _resolve_at_names(self, event: dict) -> dict[str, str]:

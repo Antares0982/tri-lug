@@ -73,9 +73,18 @@
 - Outbound: resolve the source native id to the target native id via the IdMap; TG uses `pin_chat_message`, Matrix has the bridge bot rewrite `m.room.pinned_events`.
 - Permissions: writing a Matrix pin requires the bridge bot to have the power level to send state events in the room (default `state_default` = 50 / moderator). Appservice registration itself does not grant a power level; it must be authorized by a room admin. On insufficient permission the pin fails with a log entry only and does not affect message forwarding.
 
+### Share cards (QQ mini-app / 小卡片)
+
+- QQ share cards arrive as a `json` message segment. Three share sources are recognized and forwarded as a plain `"{title}\n{url}"` line; everything else (unknown apps) falls through to the log-only path below.
+  - **bilibili** (`meta.detail_1`, link in `qqdocurl` on host `b23.tv`): title is the card `desc`; the `b23.tv` short link is expanded to its canonical long URL.
+  - **zhihu** (`meta.detail_1`, link in `qqdocurl` on host `*.zhihu.com`): title is the card `desc`; URL used as-is.
+  - **weixin** (`meta.news`, link in `jumpUrl` on host `mp.weixin.qq.com`): title is the card `title`; URL used as-is.
+- Dispatch is by URL host (not appid), and share-tracking query params are stripped from every URL. The card JSON may carry CQ HTML entities (`&#44;` etc.); it is JSON-decoded with an unescape fallback.
+- Card-to-text translation is pure (`onebot.py`). The bilibili short-link expansion is the one network hop and lives in the QQ adapter (a single redirect, like alice's `bv_modifier`), so the pure parser stays testable; a failed resolve forwards the short link unchanged. The same expansion also applies to any `b23.tv` link pasted as plain text.
+
 ### Other messages
 
-- Messages outside the v1 scope (video/audio/file/card/poke/recall, etc.) are not forwarded, but must be logged.
+- Messages outside the v1 scope (video/audio/file/poke/recall, unrecognized cards, etc.) are not forwarded, but must be logged.
 - alice is responsible for the log annotation: any event that enters a bridged room and has no forwardable content after parsing is dropped after logging one `[<platform>][log-only - not forwarded] <type + content summary>`; this is the implementation of "explicitly state log-only, do not forward", rather than adding a flag bit into the RabbitMQ payload (the relay does no translation and cannot tell whether something is bridgeable).
 - QQ side: the relay still sends the raw event to alice over RabbitMQ for logging, dropping only `meta_event` (heartbeat/lifecycle) to avoid pointlessly flooding RabbitMQ.
 

@@ -13,7 +13,12 @@ v1 scope (see docs/tri-bridge/design.md §4): text, image, sticker→image, repl
 from __future__ import annotations
 
 import base64
+import html
+import json
 import time
+from dataclasses import dataclass
+from urllib.parse import urlsplit, urlunsplit
+
 from modules.tri_lug_utils.bridge_message import (
     QQ,
     Attachment,
@@ -81,6 +86,13 @@ def parse_group_event(
             att = _image_attachment(data)
             if att is not None:
                 attachments.append(att)
+        elif stype == "json":
+            # QQ share "mini-app" card (bilibili / zhihu / weixin). Rendered to a
+            # plain "{title}\n{url}" line; the b23.tv short link it may carry is
+            # resolved to its long form later, in the adapter (network I/O).
+            card = parse_card_json(data.get("data"))
+            if card is not None:
+                text_parts.append(render_card(card))
         # face and everything else: ignored in v1
 
     text = "".join(text_parts).strip()
@@ -124,6 +136,88 @@ def _image_attachment(data: dict) -> Attachment | None:
     if file_ref:
         return Attachment("image", url=file_ref, filename=data.get("file"))
     return None
+
+
+@dataclass
+class CardShare:
+    """A QQ share card distilled to the bits we bridge.
+
+    `url` is already stripped of share-tracking query params. For bilibili it is
+    still the (short) ``b23.tv`` link — `needs_resolve` flags that the adapter
+    must expand it to the canonical long URL before forwarding.
+    """
+
+    kind: str  # "bilibili" | "zhihu" | "weixin"
+    title: str
+    url: str
+    needs_resolve: bool
+
+
+def parse_card_json(raw: str | None) -> CardShare | None:
+    """Translate a QQ ``json`` card-segment payload into a `CardShare`, or None
+    if it isn't one of the three share types we support. Pure: the bilibili
+    short link is *not* resolved here (that is network I/O, done in the adapter).
+    """
+    data = _load_card(raw)
+    if data is None:
+        return None
+    meta = data.get("meta")
+    if not isinstance(meta, dict):
+        return None
+    title, url = _card_title_url(meta)
+    if not url:
+        return None
+    host = (urlsplit(url).hostname or "").lower()
+    if host == "mp.weixin.qq.com":
+        return CardShare("weixin", title, _strip_query(url), False)
+    if host == "zhihu.com" or host.endswith(".zhihu.com"):
+        return CardShare("zhihu", title, _strip_query(url), False)
+    if host == "b23.tv":
+        return CardShare("bilibili", title, _strip_query(url), True)
+    return None
+
+
+def render_card(card: CardShare) -> str:
+    """Render a `CardShare` to the text we forward."""
+    return f"{card.title}\n{card.url}" if card.title else card.url
+
+
+def _load_card(raw: str | None) -> dict | None:
+    """Best-effort decode of the card JSON string. NapCat may hand it over with
+    CQ HTML entities (``&#44;`` etc.) intact, so retry once after unescaping."""
+    if not isinstance(raw, str) or not raw:
+        return None
+    for candidate in (raw, html.unescape(raw)):
+        try:
+            obj = json.loads(candidate)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(obj, dict):
+            return obj
+    return None
+
+
+def _card_title_url(meta: dict) -> tuple[str, str]:
+    """Pull (title, url) out of a card's ``meta``. ``detail_1`` is the mini-app
+    shape (bilibili/zhihu — the real title lives in ``desc``); ``news`` is the
+    qqconnect share shape (weixin)."""
+    detail = meta.get("detail_1")
+    if isinstance(detail, dict):
+        url = detail.get("qqdocurl") or detail.get("jumpUrl") or ""
+        title = detail.get("desc") or detail.get("title") or ""
+        return str(title).strip(), str(url).strip()
+    news = meta.get("news")
+    if isinstance(news, dict):
+        url = news.get("jumpUrl") or ""
+        title = news.get("title") or news.get("desc") or ""
+        return str(title).strip(), str(url).strip()
+    return "", ""
+
+
+def _strip_query(url: str) -> str:
+    """Keep scheme+host+path, dropping the share-tracking query and fragment."""
+    parts = urlsplit(url)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
 
 
 def _event_ts(event: dict) -> float:
