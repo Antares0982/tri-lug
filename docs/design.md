@@ -22,7 +22,7 @@
 
 ### Text
 - Direct passthrough. @mention: cross-platform account systems are not interoperable -> **degrade to plain text `@name`**, no exact pill mapping (v1).
-  - QQ's `at` segment: NapCat does not fill in `name`; alice resolves it via `get_group_member_info` into `@group-nickname` (with a TTL cache inside the QQ adapter), rather than `@QQ-number`.
+  - QQ's `at` segment: NapCat does not fill in `name`; alice resolves it via `get_group_member_info` into `<to:group-nickname>` (with a TTL cache inside the QQ adapter), rather than `<to:QQ-number>`. (QQ mentions render as `<to:name>` rather than `@name`.)
   - When a user replies on QQ to a message forwarded by the bridge, QQ automatically inserts an `at` segment pointing at the bridge bot; that at (`qq == bridge bot uin`) is dropped entirely and is not forwarded as `@bridge`.
 - Identity presentation: on the QQ/TG side use the prefix `[source] name:`, followed by a **newline** and then the message body (header and body on separate lines; if there is no body, only the header is sent); on the **Matrix side use an appservice ghost (puppet)**, with no prefix.
   The prefix logic lives inside each adapter, not in the Router.

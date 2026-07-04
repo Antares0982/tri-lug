@@ -7,7 +7,7 @@ QQ adapter.
 v1 scope (see docs/tri-bridge/design.md §4): text, image, sticker→image, reply.
 - `image` / `mface` (QQ market sticker) → image Attachment.
 - `face` (QQ small emoji) → dropped (no name map; would otherwise be noise).
-- `at` → downgraded to plain text `@name`, and the qq id collected in mentions.
+- `at` → downgraded to plain text `<to:name>`, and the qq id collected in mentions.
 """
 
 from __future__ import annotations
@@ -40,9 +40,9 @@ def parse_group_event(
 
     `self_uin`: when a user replies to a bridge-relayed message, QQ auto-inserts
     an `at` segment targeting the bridge bot; that at is dropped so it isn't
-    forwarded as a stray `@桥`. `name_map`: ``qq -> 群昵称`` resolved by the
+    forwarded as a stray `<to:桥>`. `name_map`: ``qq -> 群昵称`` resolved by the
     adapter (NapCat leaves the `at` segment's `name` empty), so mentions render
-    as `@昵称` instead of `@QQ号`.
+    as `<to:昵称>` instead of `<to:QQ号>`.
     """
     if event.get("post_type") != "message" or event.get("message_type") != "group":
         return None
@@ -78,7 +78,7 @@ def parse_group_event(
                 continue
             else:
                 name = name_map.get(qq) or data.get("name") or qq
-                text_parts.append(f"@{name} ")
+                text_parts.append(f"<to:{name}> ")
                 mentions.append(qq)
         elif stype == "reply":
             reply_to = str(data.get("id", "")) or None

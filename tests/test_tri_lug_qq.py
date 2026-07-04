@@ -88,7 +88,7 @@ def test_parse_rich_event():
     assert bm is not None
     assert bm.platform == QQ and bm.msg_id == "789"
     assert bm.reply_to_msg_id == "111"
-    assert bm.text == "@Bob hi there", repr(bm.text)
+    assert bm.text == "<to:Bob> hi there", repr(bm.text)
     assert bm.mentions == ["456"], bm.mentions
     assert len(bm.attachments) == 2 and all(a.kind == "image" for a in bm.attachments)
     assert bm.sender.display_name == "GroupAlice"
