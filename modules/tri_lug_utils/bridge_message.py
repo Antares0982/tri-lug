@@ -62,9 +62,10 @@ def sniff_image_mime(data: bytes | None) -> str | None:
 
 @dataclass
 class Attachment:
-    """A non-text payload. Stickers are normalized to `kind="image"` wherever a
-    platform can't represent them natively; `kind="sticker"` is kept only when
-    the target can render it as such."""
+    """A non-text payload. Every adapter normalizes stickers to `kind="image"`
+    on inbound (TG animated/video stickers via their static thumbnail, QQ
+    `mface`, Matrix `m.sticker`), and outbound rendering only looks at
+    `kind == "image"` — the other kinds are reserved, not yet produced."""
 
     kind: str  # "image" | "sticker" | "file" | "video" | "audio"
     url: str | None = None

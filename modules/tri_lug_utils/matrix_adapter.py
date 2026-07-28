@@ -1,18 +1,19 @@
 """Matrix appservice adapter (mautrix-python).
 
 Per-user puppeting: each TG/QQ sender is mirrored by a ghost user
-``@{prefix}{platform}_{id}:{server}`` — e.g. ``@_njulug_tg_123:li7g.com`` —
-within the appservice's exclusive user namespace, so messages appear under the
-real author's name instead of a single relay bot.
+``@{prefix}{platform}_{id}:{server}`` (the localpart lowercased, with characters
+outside ``[a-z0-9._=-/]`` replaced by ``_``), which must fall inside the
+appservice registration's exclusive user namespace. Messages therefore appear
+under the real author's name instead of a single relay bot.
 
-Skeleton status: written against mautrix 0.21.0; the HS→AS push path can only be
-exercised live once the li7g.com admin registers the appservice (as_token) and
-``https://tri-lug.chr.fan`` reaches this listener. v1 scope: text, image,
-sticker(→image), reply.
+Written against mautrix 0.21.0. v1 scope: text, image, sticker(→image), reply,
+pin.
 
-Inbound: HS pushes events to our aiohttp listener; we keep m.room.message in the
-bridged room from non-ghost senders. Loop prevention drops anything authored by
-our bot or a ghost (namespace prefix).
+Inbound: the homeserver pushes events to our aiohttp listener (so the
+registration's URL must reach ``listen_host:listen_port``). We handle
+``m.room.message`` and ``m.sticker`` in the bridged room, plus
+``m.room.pinned_events`` for pin interop. Loop prevention drops anything
+authored by our bot or a ghost (namespace prefix).
 """
 
 from __future__ import annotations

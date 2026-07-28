@@ -32,9 +32,9 @@ in
     telegraph
     # psutil
     msgpack
-    mautrix  # tri_lug Matrix appservice adapter
-    pytest  # tri_lug test suite
-    pytest-asyncio  # async test support
+    mautrix # tri_lug Matrix appservice adapter
+    pytest # tri_lug test suite
+    pytest-asyncio # async test support
     (pypkgs.buildPythonPackage rec {
       pname = "opencc";
       version = "ver.1.2.0";

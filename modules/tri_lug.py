@@ -1,9 +1,13 @@
 """Telegram ↔ QQ ↔ Matrix message bridge.
 
-Stage: the Telegram adapter is live; QQ and Matrix are MockAdapters that log
-their outbound renders and can simulate inbound messages. The Router + IdMap
-spine is real, so once the QQ (NapCat/RabbitMQ) and Matrix (appservice)
-transports are written they drop in by replacing the two mocks.
+The antares-bot module entry point: builds the three adapters around a shared
+Router + IdMap, runs the hourly IdMap purge, and registers the Telegram
+handlers (the bridged-group message handler plus /stop_bridge and
+/start_bridge).
+
+Each platform is independently switchable via its `*_ENABLED` config flag: a
+disabled side gets a MockAdapter that only logs its outbound renders, so the
+bot still runs (and the slash commands still work) with one or two sides wired.
 """
 
 from __future__ import annotations
@@ -62,8 +66,9 @@ class TriLug(TelegramBotModuleBase):
         return TelegramAdapter(ROOM_KEY, cfg.TG_CHAT_ID)
 
     def _build_qq_adapter(self, cfg):
-        """Real QQAdapter (RabbitMQ → relay → NapCat) when configured, else a
-        MockAdapter so the bot still runs before the QQ side is wired."""
+        """Real QQAdapter (RabbitMQ → relay → NapCat) when QQ_ENABLED, else a
+        MockAdapter: no broker connection is opened and outbound renders are
+        only logged."""
         if not getattr(cfg, "QQ_ENABLED", False):
             return MockAdapter(QQ, ROOM_KEY)
         transport = RabbitMQQQTransport(
@@ -82,8 +87,9 @@ class TriLug(TelegramBotModuleBase):
         return qq
 
     def _build_matrix_adapter(self, cfg):
-        """Real MatrixAdapter (appservice puppeting) when configured, else a
-        MockAdapter so the bot runs before the appservice token is available."""
+        """Real MatrixAdapter (appservice puppeting) when MATRIX_ENABLED, else a
+        MockAdapter: no appservice listener is started and outbound renders are
+        only logged."""
         if not getattr(cfg, "MATRIX_ENABLED", False):
             return MockAdapter(MATRIX, ROOM_KEY)
         return MatrixAdapter(

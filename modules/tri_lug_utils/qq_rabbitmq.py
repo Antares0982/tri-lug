@@ -6,11 +6,14 @@ sides dial out to the broker (machine B can't accept inbound). Exchange
 
   * consume `qq.event`       -> QQAdapter.handle_event
   * consume `qq.action_resp` -> resolve the pending call_action future (by echo)
+  * consume `qq.avatar_resp` -> resolve the pending fetch_avatar future (by echo)
   * publish `qq.action`      <- call_action
+  * publish `qq.avatar_req`  <- fetch_avatar
 
-`call_action` is a request/response RPC: it publishes an action tagged with a
-unique `echo` and awaits the matching response. Reuses the aio_pika/mTLS pattern
-from modules/hermes.py.
+Both outbound paths are the same echo-tagged request/response RPC (`_rpc`): it
+publishes a payload carrying a unique `echo` and awaits the response with the
+matching echo, returning None on timeout. TLS is enabled only when all three of
+cafile/certfile/keyfile are set; otherwise the connection is plaintext.
 
 Single-instance assumption: events are consumed via an exclusive queue, so QQ
 messages that arrive while alice is down are dropped (acceptable for v1).

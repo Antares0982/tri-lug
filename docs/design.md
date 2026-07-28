@@ -23,38 +23,44 @@
 ### Text
 - Direct passthrough. @mention: cross-platform account systems are not interoperable -> **degrade to plain text `@name`**, no exact pill mapping (v1).
   - QQ's `at` segment: NapCat does not fill in `name`; alice resolves it via `get_group_member_info` into `<to:group-nickname>` (with a TTL cache inside the QQ adapter), rather than `<to:QQ-number>`. (QQ mentions render as `<to:name>` rather than `@name`.)
+  - QQ `at` with `qq == "all"` renders as `@全体成员`.
   - When a user replies on QQ to a message forwarded by the bridge, QQ automatically inserts an `at` segment pointing at the bridge bot; that at (`qq == bridge bot uin`) is dropped entirely and is not forwarded as `@bridge`.
 - Identity presentation: on the QQ/TG side use the prefix `[source] name:`, followed by a **newline** and then the message body (header and body on separate lines; if there is no body, only the header is sent); on the **Matrix side use an appservice ghost (puppet)**, with no prefix.
-  The prefix logic lives inside each adapter, not in the Router.
+  The header is rendered by `header.render_header`, called from the TG and QQ adapters (never from the Router). Matrix keeps its own label map, since its displayname form differs.
   - QQ source: `[QQ] group-nickname` (note: the group nickname, not the QQ nickname).
   - Telegram source: `[TG] tg-nickname`.
   - Matrix source: `[Matrix] matrix-nickname`.
-  - The Matrix ghost's displayname follows the source user: when the source nickname changes (e.g. a QQ group card change) the ghost displayname is refreshed, not frozen at the first value.
+  - The Matrix ghost's displayname is `source-nickname (label)`, e.g. `Alice (QQ)` — the label suffix keeps identical names on different platforms distinct. It follows the source user: when the source nickname changes (e.g. a QQ group card change) the ghost displayname is refreshed, not frozen at the first value.
+  - Optional header rewrites: `TriLugConfig.HEADER_REWRITES` (absent ⇒ no-op) is an ordered list of `{"pattern": <regex>, "repl": <str>, "target": <platform | None>}` applied with `re.sub` to the whole header string, in list order. A rule with a `target` fires only when rendering into that target platform; `target` absent/None applies to every target. Compiled once on first use ⇒ a change needs a restart.
 
-- Text with links: only Telegram produces rich text where "display text != link" (message entity `text_link`). On inbound the TG adapter uses `parse_entities()` (offsets are UTF-16, so this API must be used for slicing) to convert those entities into `[text](url)` plain text before handing off to the fan; bare URLs (`url` entity) are kept as-is. Other platforms need no handling: Matrix only reads `body` and ignores `formatted_body`; bare URLs are sent as plain text (the Telegram client auto-detects them as clickable). No platform uses parse_mode/HTML on outbound.
+- Text with links: both Telegram and Matrix produce rich text where "display text != link", and both are flattened to `[text](url)` plain text on inbound.
+  - TG: the `text_link` message entity. Offsets/lengths are UTF-16 code units, so the slicing is done on the UTF-16-LE encoding. Bare URLs (`url` entity) are kept as-is.
+  - Matrix: when the content is `org.matrix.custom.html`, the reply fallback is trimmed and `formatted_body` is flattened (`<a href>` → `[text](url)`, `<br>`/block tags → newline, other tags dropped). The plain `body` alone would lose the URL. A `matrix.to` link is a user/room pill — only its display text is kept. Content without HTML formatting falls back to `body`.
+  - Bare URLs are sent as plain text (the Telegram client auto-detects them as clickable). No platform uses parse_mode/HTML on outbound.
 
 ### Images
 - Unified flow: the source side fetches the image **bytes** -> the target adapter uploads them (Matrix uploads to `mxc://` first; TG `send_photo`; QQ `image` segment).
-- QQ images: the relay on machine B fetches the bytes (preferring the url provided by NapCat, falling back to the local file from `get_image`), inlines them as base64 into the image segment of `qq.event`, and delivers them over RabbitMQ; alice decodes to bytes and uploads directly. The relay no longer just forwards NapCat's url.
+- QQ images: the relay on machine B fetches the bytes (preferring the url provided by NapCat, falling back to the local file from `get_image`), inlines them as base64 into the image segment of `qq.event`, and delivers them over RabbitMQ; alice decodes to bytes and uploads directly. A segment with no `base64` degrades to carrying the url/file ref instead.
   - The relay maintains a disk cache keyed by QQ image file id; every hour it removes files older than 3 hours.
 - Must correctly handle all combinations of image and text (including linked text) mixed together, multiple images in one message, etc. The normalized model uses `text:str + ordered attachments[]`: on inbound, merge all text and collect all images (the exact interleaving of text/images is not preserved). On outbound rendering:
   - QQ: `[reply] + text segment + each image segment`.
-  - TG: use a `send_media_group` album, with header+text as the caption of the first image (batched if more than 10 images).
-  - Matrix: send one text event first, then one event per image.
-  - Reply mapping: each target records the native id of its "first part" as the primary for that logical message in the IdMap.
+  - TG: a single image uses `send_photo` with header+text as its caption; several images use a `send_media_group` album with the caption on the first item, split into batches of 10 (only the first batch carries the caption and the reply).
+  - Matrix: send one text event first (only if there is text), then one event per image.
+  - Reply mapping: `adapter.send` returns **every** native id it produced and the Router links all of them into the same logical message, so a reply pointing at any part resolves. The first returned id is the reply anchor.
 - The relay must fetch and inline bytes for both `image` and `mface` segments (`face`, the small yellow-face emoji, is not fetched and is dropped by alice). Fetch order: first HTTP GET the url in the segment; on failure or no url, fall back to NapCat `get_image`/`get_file` to read the local cache file.
-- TG inbound albums (multiple images sharing a `media_group_id`, arriving as separate Updates, only the first carrying a caption): buffer by `media_group_id` for about 1 second and merge into a single message before handing off to the fan.
+- TG inbound albums (multiple images sharing a `media_group_id`, arriving as separate Updates, exactly one of them carrying the caption): buffer by `media_group_id` for 1 second, then merge into a single message (ordered by `message_id`; the lowest one supplies the msg id and the reply target, whichever item has the caption supplies the text) before handing off to the fan.
+- Matrix inbound captions follow MSC2530: a captioned image carries the real file name in `filename` and the caption in `body`/`formatted_body`; an uncaptioned one has no `filename` and its `body` *is* the file name (so it is not treated as text).
 
 ### Stickers (always normalized to images)
 - **TG sticker**: static webp -> use directly as an image; **animated/video sticker -> take the `sticker.thumbnail` static frame**, do not touch lottie/gif conversion.
-- **QQ `mface`** (large store emoji) -> take its image URL, treat as an image.
-- **QQ `face`** (small yellow face) -> a text/emoji placeholder, not treated as an image.
+- **QQ `mface`** (large store emoji) -> handled exactly like an `image` segment (relay-inlined bytes, falling back to the url).
+- **QQ `face`** (small yellow face) -> dropped entirely; there is no name map, so a placeholder would just be noise. A message whose only segments are `face` therefore parses to nothing and is dropped silently.
 - **Matrix `m.sticker`** -> already an image, treat as an image.
 
 ### Replies
 - On inbound record `reply_to_msg_id` (origin platform native id); the Router resolves it via the IdMap into the target platform native id.
 - Native replies per platform: TG `reply_to_message_id`; QQ `reply` segment `{id}`;
-  Matrix `m.relates_to.m.in_reply_to` plus the spec-required `formatted_body` fallback quote block.
+  Matrix `m.relates_to.m.in_reply_to` only (mautrix's `set_reply` writes the relation; no `formatted_body` fallback quote block is generated). Inbound, the fallback quote block is stripped before flattening, so a quoted reply never leaks into the bridged text.
 - IdMap:
   - Only records replies from the last 24h; old ids are discarded on a 1h trigger.
   - Message id records need not be persisted.
@@ -80,13 +86,15 @@
   - **zhihu** (`meta.detail_1`, link in `qqdocurl` on host `*.zhihu.com`): title is the card `desc`; URL used as-is.
   - **weixin** (`meta.news`, link in `jumpUrl` on host `mp.weixin.qq.com`): title is the card `title`; URL used as-is.
 - Dispatch is by URL host (not appid), and share-tracking query params are stripped from every URL. The card JSON may carry CQ HTML entities (`&#44;` etc.); it is JSON-decoded with an unescape fallback.
-- Card-to-text translation is pure (`onebot.py`). The bilibili short-link expansion is the one network hop and lives in the QQ adapter (a single redirect, like alice's `bv_modifier`), so the pure parser stays testable; a failed resolve forwards the short link unchanged. The same expansion also applies to any `b23.tv` link pasted as plain text.
+- Card-to-text translation is pure (`onebot.py`). The bilibili short-link expansion is the one network hop and lives in the QQ adapter (following a single redirect, keeping scheme+host+path), so the pure parser stays testable; a failed resolve forwards the short link unchanged. The resolver is injectable, which keeps the tests network-free. The same expansion also applies to any `b23.tv` link pasted as plain text.
 
 ### Other messages
 
-- Messages outside the v1 scope (video/audio/file/poke/recall, unrecognized cards, etc.) are not forwarded, but must be logged.
-- alice is responsible for the log annotation: any event that enters a bridged room and has no forwardable content after parsing is dropped after logging one `[<platform>][log-only - not forwarded] <type + content summary>`; this is the implementation of "explicitly state log-only, do not forward", rather than adding a flag bit into the RabbitMQ payload (the relay does no translation and cannot tell whether something is bridgeable).
-- QQ side: the relay still sends the raw event to alice over RabbitMQ for logging, dropping only `meta_event` (heartbeat/lifecycle) to avoid pointlessly flooding RabbitMQ.
+- Messages outside the v1 scope (video/audio/file, unrecognized cards, etc.) are not forwarded.
+- The log annotation is a **QQ-side feature only**: a group event that parses to nothing bridgeable is dropped after one WARNING `[QQ][log-only · not forwarded] <type + segment/notice summary>`. alice does the annotating rather than flagging it in the RabbitMQ payload, because the relay does no translation and cannot tell whether something is bridgeable.
+  - Exception — **noise types are dropped silently, without any log line**: the `group_msg_emoji_like` and `group_recall` notices, `sub_type=poke`, and messages whose segments are all `face`. These recur often enough that logging them is pure spam.
+- TG and Matrix have no equivalent annotation: an event with no bridgeable content is dropped silently on those sides.
+- QQ side: the relay sends the raw event to alice over RabbitMQ even when it isn't bridgeable (that is what makes the annotation above possible), dropping only `meta_event` (heartbeat/lifecycle) to avoid pointlessly flooding RabbitMQ.
 
 
 

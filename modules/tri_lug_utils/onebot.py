@@ -1,10 +1,10 @@
 """OneBot 11 ⇄ BridgeMessage translation (pure, no I/O).
 
 Kept free of any transport so it can be unit-tested against captured OneBot
-event JSON. Transport (RabbitMQ ↔ the machine-B NapCat relay) lives in the
-QQ adapter.
+event JSON. The transport (RabbitMQ ↔ the machine-B NapCat relay) lives in
+`qq_rabbitmq.py`, behind the `QQTransport` interface in `qq_adapter.py`.
 
-v1 scope (see docs/tri-bridge/design.md §4): text, image, sticker→image, reply.
+v1 scope (see docs/design.md §2): text, image, sticker→image, reply, share card.
 - `image` / `mface` (QQ market sticker) → image Attachment.
 - `face` (QQ small emoji) → dropped (no name map; would otherwise be noise).
 - `at` → downgraded to plain text `<to:name>`, and the qq id collected in mentions.
@@ -234,10 +234,14 @@ def _event_ts(event: dict) -> float:
 def is_noise_event(event: dict) -> bool:
     """Return True for QQ events that are pure noise and don't need logging.
 
+    Everything else that parses to nothing bridgeable still gets one
+    ``[QQ][log-only · not forwarded]`` line; these are dropped silently.
+
     Suppressed types:
     - ``notice_type=group_msg_emoji_like``  (reaction notifications)
-    - messages whose only segments are ``face``  (small emoji, not bridgeable)
+    - ``notice_type=group_recall``  (message withdrawals)
     - ``sub_type=poke``  (poke / nudge notices)
+    - messages whose only segments are ``face``  (small emoji, not bridgeable)
     """
     post_type = event.get("post_type")
     if post_type == "notice":

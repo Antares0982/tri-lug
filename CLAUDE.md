@@ -8,6 +8,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `docs/design.md` is the authoritative spec — read it before changing forwarding, reply, media, avatar, pin, or pause behavior. The notes below are the map; `design.md` has the per-feature rules.
 
+External API reference for the QQ side: **NapCat** — <https://napneko.github.io/api/4.18.13> (the trailing `4.18.13` is the NapCat version and changes over time; bump it to whatever version the relay machine actually runs before trusting the page). It documents the OneBot11 actions/segments this repo calls, e.g. `send_group_msg`, `get_group_member_info`, `get_image`.
+
 ## Environment, run, test
 
 The Python environment (incl. the `antares_bot` dependency, `mautrix`, `aiosqlite`, `aio_pika`) is provided by Nix:
@@ -31,7 +33,7 @@ pytest tests/test_tri_lug_mock.py::test_pacing_gap   # one test
 - `test_tri_lug_qq.py` — OneBot11 ⇄ BridgeMessage + QQAdapter
 - `test_tri_lug_qq_transport.py` — RabbitMQ transport RPC/echo correlation
 
-Lint with **ruff** (`ruff check` / `ruff format`; only the `.ruff_cache/` is checked in, no config file ⇒ defaults).
+Lint with **ruff** (`ruff check` / `ruff format`). There is no ruff config ⇒ defaults, and the devShell does not ship ruff — use the system one.
 
 ## Architecture
 
@@ -52,10 +54,11 @@ Adapters translate platform events into `BridgeMessage` (text + ordered `Attachm
 
 ### Adapters (`adapters.py` + per-platform files)
 `BaseAdapter` defines `send` (outbound render) and `_emit` (inbound → `Router.submit`). One adapter owns one platform's side of one room.
-- **`TelegramAdapter`** (`tg_adapter.py`) — live, driven by antares-bot's handler dispatch via `on_update`.
+- **`TelegramAdapter`** (`tg_adapter.py`) — driven by antares-bot's handler dispatch via `on_update`.
 - **`QQAdapter`** (`qq_adapter.py`) — talks to a remote NapCat instance through the **`QQTransport` abstraction** (`onebot.py` does the pure OneBot11 ⇄ BridgeMessage translation). The only concrete transport is `RabbitMQQQTransport` (`qq_rabbitmq.py`), which pairs with a separate `tri-lug-qq-relay` on the QQ machine; both dial out to the broker. The transport is intentionally swappable — keep transport concerns out of `onebot.py`/`qq_adapter.py`. Avatar bytes come over a separate request/response RPC (`qq.avatar_req`/`qq.avatar_resp`, echo-correlated) so alice never touches Tencent's CDN.
-- **`MatrixAdapter`** (`matrix_adapter.py`) — mautrix appservice; uses **ghost/puppet** users (no text prefix) instead of the `[label] name:` header that TG/QQ use (`header.py`).
-- **`MockAdapter`** — logging-only stand-in. Each platform independently degrades to a mock when its `*_ENABLED` flag is off, so the bot still runs (and slash commands still work) before that transport is wired.
+  - **The relay lives outside this repo**, in `$NIX_DOT_FILES/rpi/qq-relay/qq_napcat_relay.py` (single file: NapCat websocket ⇄ RabbitMQ, image byte fetching + disk cache, the avatar RPC). The two sides share an undeclared wire contract — routing keys, the `echo` correlation, the `base64`/`ts` fields injected into `qq.event`, `TRI_LUG_EXCHANGE`. **Anything that touches that contract has to be changed on both sides in the same pass**, and neither repo's tests will catch a mismatch (this side's suite stubs the transport entirely).
+- **`MatrixAdapter`** (`matrix_adapter.py`) — mautrix appservice; uses **ghost/puppet** users (no text prefix) instead of the `[label] name:` header that TG/QQ use (`header.py`). It is also the only adapter that reads `formatted_body`, flattening the HTML so `<a href>` hyperlinks survive as `[text](url)`.
+- **`MockAdapter`** — logging-only stand-in. Each platform independently degrades to a mock when its `*_ENABLED` flag is off, so the bot still runs (and slash commands still work) with that transport detached.
 
 ### IdMap (`idmap.py`)
 aiosqlite-backed cross-platform id map. Rows sharing a `logical_id` represent one logical message's native ids across platforms, enabling reply re-pointing. A `_link_lock` serializes the read→allocate→insert in `link()` so concurrent fan-outs can't merge into one logical id. TTL 24h, purged hourly by a background task in `tri_lug.py`. Use `":memory:"` for tests.
@@ -65,4 +68,5 @@ aiosqlite-backed cross-platform id map. Rows sharing a `logical_id` represent on
 - **Loop prevention lives in each adapter**, before `_emit` — an adapter must drop messages authored by its own bridge identity (e.g. `QQ_SELF_UIN`, the Matrix bot, the TG bot) or the bridge echoes forever.
 - **Two kinds of "off":** `ENABLED=False` makes the module fully inert (no handlers, not even the pause commands). The runtime **pause** (`/stop_bridge` / `/start_bridge`, recognized on all three platforms) only suspends forwarding while the module keeps running, and is **not persisted** — a restart returns to running. Control commands are intercepted in the adapter *before* the pause drop, so `/start_bridge` always works.
 - **Per-platform enable flags** (`TG_ENABLED`/`QQ_ENABLED`/`MATRIX_ENABLED` in `TriLugConfig`) select real adapter vs `MockAdapter` in the `_build_*_adapter` methods — the wiring pattern for bringing one side up at a time.
-- Out-of-scope events (video/audio/file/poke/recall, QQ small `face` emoji, etc.) are **not forwarded but must be logged** (`[<platform>][log-only - not forwarded] ...`); alice does this annotation since the relay can't tell what's bridgeable.
+- **The `[label] name:` header has exactly one renderer** (`header.render_header`), called by the TG and QQ adapters. `TriLugConfig.HEADER_REWRITES` (optional) post-processes it with an ordered list of `{"pattern", "repl", "target"}` `re.sub` rules — `target` scopes a rule to one destination platform. Rules are `lru_cache`d ⇒ a config change needs a restart.
+- Out-of-scope events (video/audio/file, unrecognized cards, etc.) are not forwarded. **Only the QQ side annotates them**: `qq_adapter` logs one WARNING `[QQ][log-only · not forwarded] <describe_event(...)>`, since the relay can't tell what's bridgeable. `onebot.is_noise_event` carves out the high-frequency noise that is dropped *without* a log line (emoji-like and recall notices, pokes, `face`-only messages). TG and Matrix drop unbridgeable events silently.

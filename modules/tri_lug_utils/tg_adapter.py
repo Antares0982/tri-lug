@@ -268,7 +268,7 @@ class TelegramAdapter(BaseAdapter):
     async def _extract_attachments(self, msg: "Message") -> list[Attachment]:
         """v1: photos and stickers, both normalized to a single image
         Attachment. Animated/video stickers use their static thumbnail to avoid
-        lottie/webm conversion (see design doc §4)."""
+        lottie/webm conversion (see docs/design.md §2, Stickers)."""
         out: list[Attachment] = []
         if msg.photo:
             data = await self._download(msg.photo[-1])
