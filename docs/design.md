@@ -27,6 +27,7 @@
   - When a user replies on QQ to a message forwarded by the bridge, QQ automatically inserts an `at` segment pointing at the bridge bot; that at (`qq == bridge bot uin`) is dropped entirely and is not forwarded as `@bridge`.
 - Identity presentation: on the QQ/TG side use the prefix `[source] name:`, followed by a **newline** and then the message body (header and body on separate lines; if there is no body, only the header is sent); on the **Matrix side use an appservice ghost (puppet)**, with no prefix.
   The header is rendered by `header.render_header`, called from the TG and QQ adapters (never from the Router). Matrix keeps its own label map, since its displayname form differs.
+  - On **Telegram the header is bold** (the whole `[source] name:`, colon included; the body after it is not). It is bolded with an explicit `MessageEntity(BOLD, offset=0, length=<header>)` rather than a parse_mode — see the note on parse_mode below. Offsets are UTF-16 code units, so the length is measured on the UTF-16-LE encoding. QQ has no rich text and is left plain.
   - QQ source: `[QQ] group-nickname` (note: the group nickname, not the QQ nickname).
   - Telegram source: `[TG] tg-nickname`.
   - Matrix source: `[Matrix] matrix-nickname`.
@@ -36,7 +37,7 @@
 - Text with links: both Telegram and Matrix produce rich text where "display text != link", and both are flattened to `[text](url)` plain text on inbound.
   - TG: the `text_link` message entity. Offsets/lengths are UTF-16 code units, so the slicing is done on the UTF-16-LE encoding. Bare URLs (`url` entity) are kept as-is.
   - Matrix: when the content is `org.matrix.custom.html`, the reply fallback is trimmed and `formatted_body` is flattened (`<a href>` → `[text](url)`, `<br>`/block tags → newline, other tags dropped). The plain `body` alone would lose the URL. A `matrix.to` link is a user/room pill — only its display text is kept. Content without HTML formatting falls back to `body`.
-  - Bare URLs are sent as plain text (the Telegram client auto-detects them as clickable). No platform uses parse_mode/HTML on outbound.
+  - Bare URLs are sent as plain text (the Telegram client auto-detects them as clickable). **No platform uses parse_mode/HTML on outbound** — bridged text routinely contains `_`, `*`, `[text](url)` and raw `<`, none of which is ours to escape, and a parse mode would mangle or reject it. Telegram's bold header is therefore expressed as an explicit entity, which leaves the body untouched.
 
 ### Images
 - Unified flow: the source side fetches the image **bytes** -> the target adapter uploads them (Matrix uploads to `mxc://` first; TG `send_photo`; QQ `image` segment).
@@ -56,6 +57,13 @@
 - **QQ `mface`** (large store emoji) -> handled exactly like an `image` segment (relay-inlined bytes, falling back to the url).
 - **QQ `face`** (small yellow face) -> dropped entirely; there is no name map, so a placeholder would just be noise. A message whose only segments are `face` therefore parses to nothing and is dropped silently.
 - **Matrix `m.sticker`** -> already an image, treat as an image.
+
+### Voice notes (QQ -> TG/Matrix, one-way)
+
+- A QQ voice message arrives as a `record` segment. It is forwarded as an **audio attachment**; the reverse direction is out of scope (a Telegram or Matrix voice message is still dropped silently on those sides).
+- QQ stores voice as **SILK**, which neither Telegram nor Matrix can play, and the segment's own `url` points at that raw SILK — so unlike images there is no url/file fallback. The relay is the only source of usable bytes: it calls NapCat `get_record` with `out_format=mp3` (NapCat runs it through ffmpeg and returns the converted file inline as base64), stamps the resulting `mime` onto the segment, and inlines the bytes like an image. Converted audio is disk-cached under its own key namespace so it can't collide with an image sharing the same file id.
+- A segment that reaches alice without `base64` yields no attachment, so a voice-only message parses to nothing and takes the ordinary log-only path (`segments=['record']`). That is the intended degradation when NapCat has no ffmpeg or the action times out — nothing unplayable is ever forwarded.
+- Rendering: TG uses `send_audio` (**not** `send_voice`, which only accepts OGG/OPUS) with the header as caption; Matrix sends an `m.audio` event with an `AudioInfo` mimetype. Since QQ never receives its own messages back, the QQ renderer ignores audio attachments entirely.
 
 ### Replies
 - On inbound record `reply_to_msg_id` (origin platform native id); the Router resolves it via the IdMap into the target platform native id.
@@ -90,7 +98,7 @@
 
 ### Other messages
 
-- Messages outside the v1 scope (video/audio/file, unrecognized cards, etc.) are not forwarded.
+- Messages outside the v1 scope (video/file, unrecognized cards, TG/Matrix voice, etc.) are not forwarded. (QQ voice *is* forwarded — see Voice notes above.)
 - The log annotation is a **QQ-side feature only**: a group event that parses to nothing bridgeable is dropped after one WARNING `[QQ][log-only · not forwarded] <type + segment/notice summary>`. alice does the annotating rather than flagging it in the RabbitMQ payload, because the relay does no translation and cannot tell whether something is bridgeable.
   - Exception — **noise types are dropped silently, without any log line**: the `group_msg_emoji_like` and `group_recall` notices, `sub_type=poke`, and messages whose segments are all `face`. These recur often enough that logging them is pure spam.
 - TG and Matrix have no equivalent annotation: an event with no bridgeable content is dropped silently on those sides.

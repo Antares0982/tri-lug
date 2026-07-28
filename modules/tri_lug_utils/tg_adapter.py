@@ -3,7 +3,12 @@
 Inbound: text (with `text_link` entities flattened to `[label](url)`), photos and
 stickers (normalized to image), replies, and albums (media groups, which arrive
 as several Updates sharing a `media_group_id` and are reassembled into one
-message). Outbound: text, single photo, or a media-group album.
+message). Outbound: text, single photo, a media-group album, or audio (a bridged
+QQ voice note).
+
+The `[label] name:` header is bolded via an explicit `MessageEntity` rather than
+a parse_mode, so the body after it is never scanned for markup and needs no
+escaping.
 """
 
 from __future__ import annotations
@@ -322,39 +327,84 @@ class TelegramAdapter(BaseAdapter):
             return None
 
     # ----------------------------------------------------------------- outbound
+    @staticmethod
+    def _caption(msg: BridgeMessage) -> tuple[str, list[MessageEntity]]:
+        """Render the outbound text as `header\\nbody` plus the entity that bolds
+        the header (`[QQ] name:` — the colon included).
+
+        An explicit entity is used instead of parse_mode="HTML"/Markdown so the
+        body is passed through verbatim: bridged text routinely contains `_`,
+        `*`, `[text](url)` and raw `<`, all of which would need escaping (and
+        would break) under a parse mode. The entity offset/length are UTF-16 code
+        units, like every Telegram offset."""
+        header = render_header(msg, TG)
+        text = header + (f"\n{msg.text}" if msg.text else "")
+        length = len(header.encode("utf-16-le")) // 2
+        return text, [MessageEntity(MessageEntity.BOLD, offset=0, length=length)]
+
     async def send(
         self, msg: BridgeMessage, reply_to_native_id: str | None
     ) -> list[str]:
         if self._app is None:
             _LOGGER.warning("[tg.send] app not attached, dropping message")
             return []
-        bot = self._app.bot
         reply_id = int(reply_to_native_id) if reply_to_native_id else None
-        caption = render_header(msg, TG) + (f"\n{msg.text}" if msg.text else "")
+        caption, entities = self._caption(msg)
         images = [
             a
             for a in msg.attachments
             if a.kind == "image" and (a.data is not None or a.url)
         ]
+        audios = [
+            a
+            for a in msg.attachments
+            if a.kind == "audio" and (a.data is not None or a.url)
+        ]
 
-        if not images:
-            sent = await bot.send_message(
-                chat_id=self.chat_id, text=caption, reply_to_message_id=reply_id
+        if not images and not audios:
+            sent = await self._app.bot.send_message(
+                chat_id=self.chat_id,
+                text=caption,
+                entities=entities,
+                reply_to_message_id=reply_id,
             )
             return [str(sent.message_id)]
 
+        # Whichever media leg goes first carries the caption and the reply; every
+        # produced id is returned (in order, first = reply anchor) so the Router
+        # links each one.
+        ids: list[str] = []
+        if images:
+            ids.extend(await self._send_images(images, caption, entities, reply_id))
+        for audio in audios:
+            ids.append(
+                await self._send_audio(
+                    audio, caption, entities, reply_id, first=not ids
+                )
+            )
+        return ids
+
+    async def _send_images(
+        self,
+        images: list[Attachment],
+        caption: str,
+        entities: list[MessageEntity],
+        reply_id: int | None,
+    ) -> list[str]:
+        assert self._app is not None
+        bot = self._app.bot
         if len(images) == 1:
             sent = await bot.send_photo(
                 chat_id=self.chat_id,
                 photo=self._media_src(images[0]),
                 caption=caption,
+                caption_entities=entities,
                 reply_to_message_id=reply_id,
             )
             return [str(sent.message_id)]
 
         # Multiple images -> media-group album(s); caption on the first item.
-        # The first batch carries the reply + caption; every produced id is
-        # returned (in order, first = reply anchor) so each is linked.
+        # The first batch carries the reply + caption.
         ids: list[str] = []
         for batch_start in range(0, len(images), _MEDIA_GROUP_MAX):
             batch = images[batch_start : batch_start + _MEDIA_GROUP_MAX]
@@ -362,6 +412,9 @@ class TelegramAdapter(BaseAdapter):
                 InputMediaPhoto(
                     media=self._media_src(img),
                     caption=caption if (batch_start == 0 and i == 0) else None,
+                    caption_entities=entities
+                    if (batch_start == 0 and i == 0)
+                    else None,
                 )
                 for i, img in enumerate(batch)
             ]
@@ -372,3 +425,26 @@ class TelegramAdapter(BaseAdapter):
             )
             ids.extend(str(m.message_id) for m in sent_msgs)
         return ids
+
+    async def _send_audio(
+        self,
+        audio: Attachment,
+        caption: str,
+        entities: list[MessageEntity],
+        reply_id: int | None,
+        *,
+        first: bool,
+    ) -> str:
+        """Send one audio attachment (a bridged QQ voice note, transcoded to mp3
+        by the relay). `send_audio` rather than `send_voice`: the latter only
+        accepts OGG/OPUS and rejects everything else."""
+        assert self._app is not None
+        sent = await self._app.bot.send_audio(
+            chat_id=self.chat_id,
+            audio=self._media_src(audio),
+            filename=audio.filename or "voice.mp3",
+            caption=caption if first else None,
+            caption_entities=entities if first else None,
+            reply_to_message_id=reply_id if first else None,
+        )
+        return str(sent.message_id)

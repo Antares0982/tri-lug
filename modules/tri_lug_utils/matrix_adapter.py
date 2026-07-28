@@ -7,7 +7,7 @@ appservice registration's exclusive user namespace. Messages therefore appear
 under the real author's name instead of a single relay bot.
 
 Written against mautrix 0.21.0. v1 scope: text, image, sticker(→image), reply,
-pin.
+pin, plus outbound-only audio (a bridged QQ voice note → `m.audio`).
 
 Inbound: the homeserver pushes events to our aiohttp listener (so the
 registration's URL must reach ``listen_host:listen_port``). We handle
@@ -25,6 +25,7 @@ import aiohttp
 from mautrix.appservice import AppService, IntentAPI
 from mautrix.errors import MatrixError
 from mautrix.types import (
+    AudioInfo,
     ContentURI,
     EventID,
     EventType,
@@ -400,18 +401,27 @@ class MatrixAdapter(BaseAdapter):
             event_ids.append(str(await intent.send_message(self._room_id, content)))
 
         for att in msg.attachments:
-            if att.kind != "image":
+            if att.kind not in ("image", "audio"):
                 continue
             data = await self._attachment_bytes(att)
             if data is None:
                 continue
-            mime = att.mime or sniff_image_mime(data)
+            is_audio = att.kind == "audio"
+            # Audio always carries its mime from the source (the relay names the
+            # transcoded format); only images need sniffing, since mautrix can't
+            # auto-detect without libmagic.
+            mime = att.mime or (None if is_audio else sniff_image_mime(data))
             mxc = await intent.upload_media(data, mime_type=mime, filename=att.filename)
+            info = None
+            if mime:
+                info = (
+                    AudioInfo(mimetype=mime) if is_audio else ImageInfo(mimetype=mime)
+                )
             content = MediaMessageEventContent(
-                msgtype=MessageType.IMAGE,
-                body=att.filename or "image",
+                msgtype=MessageType.AUDIO if is_audio else MessageType.IMAGE,
+                body=att.filename or ("voice" if is_audio else "image"),
                 url=mxc,
-                info=ImageInfo(mimetype=mime) if mime else None,
+                info=info,
             )
             if reply_evt and not event_ids:
                 content.set_reply(reply_evt)

@@ -64,8 +64,13 @@ def sniff_image_mime(data: bytes | None) -> str | None:
 class Attachment:
     """A non-text payload. Every adapter normalizes stickers to `kind="image"`
     on inbound (TG animated/video stickers via their static thumbnail, QQ
-    `mface`, Matrix `m.sticker`), and outbound rendering only looks at
-    `kind == "image"` — the other kinds are reserved, not yet produced."""
+    `mface`, Matrix `m.sticker`).
+
+    `kind="audio"` is produced only by the QQ adapter, from a `record` voice note
+    the relay transcoded to mp3, and is rendered by the TG (`send_audio`) and
+    Matrix (`m.audio`) adapters; QQ itself never receives one back, so its
+    renderer ignores the kind. The remaining kinds are reserved, not yet
+    produced."""
 
     kind: str  # "image" | "sticker" | "file" | "video" | "audio"
     url: str | None = None

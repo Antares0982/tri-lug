@@ -4,8 +4,11 @@ Kept free of any transport so it can be unit-tested against captured OneBot
 event JSON. The transport (RabbitMQ ↔ the machine-B NapCat relay) lives in
 `qq_rabbitmq.py`, behind the `QQTransport` interface in `qq_adapter.py`.
 
-v1 scope (see docs/design.md §2): text, image, sticker→image, reply, share card.
+v1 scope (see docs/design.md §2): text, image, sticker→image, voice, reply,
+share card.
 - `image` / `mface` (QQ market sticker) → image Attachment.
+- `record` (QQ voice note) → audio Attachment, but only from the transcoded
+  bytes the relay inlines (the raw segment is SILK, which nothing can play).
 - `face` (QQ small emoji) → dropped (no name map; would otherwise be noise).
 - `at` → downgraded to plain text `<to:name>`, and the qq id collected in mentions.
 """
@@ -86,6 +89,10 @@ def parse_group_event(
             att = _image_attachment(data)
             if att is not None:
                 attachments.append(att)
+        elif stype == "record":
+            att = _record_attachment(data)
+            if att is not None:
+                attachments.append(att)
         elif stype == "json":
             # QQ share "mini-app" card (bilibili / zhihu / weixin). Rendered to a
             # plain "{title}\n{url}" line; the b23.tv short link it may carry is
@@ -136,6 +143,35 @@ def _image_attachment(data: dict) -> Attachment | None:
     if file_ref:
         return Attachment("image", url=file_ref, filename=data.get("file"))
     return None
+
+
+# The relay asks NapCat to transcode voice notes to mp3; the mime is still read
+# off the segment so changing that format needs no edit on this side.
+_RECORD_MIME = "audio/mpeg"
+_RECORD_EXT = {"audio/mpeg": "mp3", "audio/ogg": "ogg", "audio/mp4": "m4a"}
+
+
+def _record_attachment(data: dict) -> Attachment | None:
+    """Build an audio Attachment from an OneBot ``record`` (voice) segment.
+
+    Unlike images there is no url/file fallback: a QQ voice note is SILK-encoded
+    and the segment's own url points at that raw SILK, which neither Telegram nor
+    Matrix can play. Only the bytes the relay transcoded (via NapCat
+    ``get_record``) and inlined as ``base64`` are usable, so a segment without
+    them yields None — the caller then reports the message on the log-only path
+    rather than forwarding something unplayable."""
+    b64 = data.get("base64")
+    if not b64:
+        return None
+    try:
+        raw_bytes = base64.b64decode(b64)
+    except ValueError:
+        return None
+    if not raw_bytes:
+        return None
+    mime = str(data.get("mime") or _RECORD_MIME)
+    ext = _RECORD_EXT.get(mime) or mime.rpartition("/")[2] or "bin"
+    return Attachment("audio", data=raw_bytes, mime=mime, filename=f"voice.{ext}")
 
 
 @dataclass
@@ -291,6 +327,9 @@ def build_send_segments(
     segments.append({"type": "text", "data": {"text": body}})
 
     for att in msg.attachments:
+        # Images only: audio attachments exist but are QQ-inbound (voice notes),
+        # and QQ never receives its own messages back, so there is nothing to
+        # render here (TG/Matrix voice is not bridged — see docs/design.md §2).
         if att.kind != "image":
             continue
         file_ref = _attachment_file_ref(att)

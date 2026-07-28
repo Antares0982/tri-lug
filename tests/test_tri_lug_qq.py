@@ -3,13 +3,15 @@
 Covers, with no RabbitMQ / NapCat:
   1. parse_group_event: reply + at + text + image + mface + face -> BridgeMessage
   2. parse rejects non-message / empty events
-  3. build_send_segments: reply prepend, identity header, base64 image
-  4. QQAdapter.handle_event: group filter + self-message loop prevention + emit
-  5. QQAdapter.send via a fake transport: returns native id, builds right action
+  3. record (voice) -> audio Attachment, and the no-bytes degradation
+  4. build_send_segments: reply prepend, identity header, base64 image
+  5. QQAdapter.handle_event: group filter + self-message loop prevention + emit
+  6. QQAdapter.send via a fake transport: returns native id, builds right action
 """
 
 from __future__ import annotations
 
+import base64
 import json
 
 from modules.tri_lug_utils.adapters import MockAdapter
@@ -184,6 +186,54 @@ async def test_adapter_resolves_b23(idmap):
         "https://www.bilibili.com/video/BV1xx"
     ), repr(tg.sent[0][1].text)
     await router.stop()
+
+
+def test_parse_record():
+    """A voice note the relay transcoded and inlined becomes an audio
+    Attachment, tagged with the mime the relay chose."""
+    ev = make_group_event(
+        [
+            {
+                "type": "record",
+                "data": {
+                    "file": "abc.amr",
+                    "url": "https://x/abc.amr",  # the raw SILK — must be ignored
+                    "base64": base64.b64encode(b"ID3fake-mp3").decode(),
+                    "mime": "audio/mpeg",
+                },
+            }
+        ]
+    )
+    bm = parse_group_event(ev, ROOM)
+    assert bm is not None
+    assert bm.text == ""
+    assert len(bm.attachments) == 1, bm.attachments
+    att = bm.attachments[0]
+    assert att.kind == "audio" and att.data == b"ID3fake-mp3"
+    assert att.mime == "audio/mpeg" and att.filename == "voice.mp3"
+    assert att.url is None, "the SILK url must never be forwarded"
+
+
+def test_parse_record_without_bytes():
+    """No inlined bytes (ffmpeg missing / get_record timed out) => nothing
+    bridgeable, so the message falls through to the log-only path rather than
+    forwarding an unplayable SILK reference."""
+    ev = make_group_event(
+        [{"type": "record", "data": {"file": "abc.amr", "url": "https://x/abc.amr"}}]
+    )
+    assert parse_group_event(ev, ROOM) is None
+
+
+def test_parse_record_defaults_mime():
+    """A segment without an explicit mime falls back to mp3, what the relay
+    asks NapCat for."""
+    ev = make_group_event(
+        [{"type": "record", "data": {"base64": base64.b64encode(b"x").decode()}}]
+    )
+    bm = parse_group_event(ev, ROOM)
+    assert bm is not None
+    assert bm.attachments[0].mime == "audio/mpeg"
+    assert bm.attachments[0].filename == "voice.mp3"
 
 
 def test_build_segments():
