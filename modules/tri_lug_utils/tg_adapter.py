@@ -1,10 +1,11 @@
 """Live Telegram adapter (python-telegram-bot).
 
-Inbound: text (with `text_link` entities flattened to `[label](url)`), photos and
-stickers (normalized to image), replies, and albums (media groups, which arrive
-as several Updates sharing a `media_group_id` and are reassembled into one
-message). Outbound: text, single photo, a media-group album, or audio (a bridged
-QQ voice note).
+Inbound: text (with `text_link` entities flattened to `[label](url)`), photos,
+stickers and GIFs (all normalized to image; animated ones are converted to an
+animated GIF locally, see `media.py`), replies, and albums (media groups, which
+arrive as several Updates sharing a `media_group_id` and are reassembled into
+one message). Outbound: text, single photo, a media-group album, an animation,
+or audio (a bridged QQ voice note).
 
 The `[label] name:` header is bolded via an explicit `MessageEntity` rather than
 a parse_mode, so the body after it is never scanned for markup and needs no
@@ -14,7 +15,10 @@ escaping.
 from __future__ import annotations
 
 import asyncio
+import datetime
+import itertools
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -22,12 +26,14 @@ from telegram import InputMediaPhoto, MessageEntity
 
 from antares_bot.bot_logging import get_logger
 
+from modules.tri_lug_utils import media
 from modules.tri_lug_utils.adapters import BaseAdapter
 from modules.tri_lug_utils.bridge_message import (
     TG,
     Attachment,
     BridgeMessage,
     BridgeUser,
+    sniff_image_mime,
 )
 from modules.tri_lug_utils.header import render_header
 
@@ -48,6 +54,23 @@ _MEDIA_GROUP_MAX = 10
 # isn't refetched on every message but a changed one still propagates.
 _AVATAR_TTL = 6 * 3600.0
 
+# Converted animations are cached by `file_unique_id` (Telegram's stable content
+# key) so a sticker that gets spammed is only ever converted once. Failures are
+# cached too — a sticker that won't convert won't convert next time either, and
+# retrying costs a subprocess on the latency-sensitive inbound path.
+_ANIM_CACHE_MAX = 128
+
+# Ceilings on `msg.animation` (a Telegram "GIF" is really a silent MP4, and can
+# be minutes long). Over either limit the static thumbnail is bridged instead:
+# a long MP4 makes a huge GIF, which is slow to produce, blows past QQ's image
+# limits, and bloats the base64 payload on the QQ transport.
+_GIF_MAX_SECONDS = 10.0
+_GIF_MAX_BYTES = 5 * 1024 * 1024
+
+# Ceiling on what a conversion may *produce*. A GIF past this would overrun QQ's
+# image limits and bloat the base64 payload on the QQ transport.
+_ANIM_MAX_OUTPUT_BYTES = 8 * 1024 * 1024
+
 
 @dataclass
 class _Album:
@@ -66,6 +89,8 @@ class TelegramAdapter(BaseAdapter):
         self._albums: dict[str, _Album] = {}
         # tg user id -> (fetched_at, avatar_key|None, bytes|None)
         self._avatars: dict[int, tuple[float, str | None, bytes | None]] = {}
+        # file_unique_id -> converted GIF bytes, or None for "known unconvertible"
+        self._anims: OrderedDict[str, bytes | None] = OrderedDict()
 
     def attach_app(self, app: "Application") -> None:
         self._app = app
@@ -271,9 +296,17 @@ class TelegramAdapter(BaseAdapter):
         return "".join(out)
 
     async def _extract_attachments(self, msg: "Message") -> list[Attachment]:
-        """v1: photos and stickers, both normalized to a single image
-        Attachment. Animated/video stickers use their static thumbnail to avoid
-        lottie/webm conversion (see docs/design.md §2, Stickers)."""
+        """Photos, stickers and GIFs, all normalized to image Attachments.
+
+        Animated stickers (`.tgs` Lottie), video stickers (`.webm`) and GIFs
+        (`msg.animation`, really a silent MP4) are converted to an animated GIF
+        here on the inbound path, so QQ and Matrix each receive the same moving
+        bytes (see docs/design.md §2, Stickers). Conversion happens before the
+        Router's fan, which hands the *same* BridgeMessage to every target — so
+        one conversion serves both, and no adapter has to mutate shared state.
+
+        Every conversion failure degrades to the static thumbnail rather than
+        dropping anything."""
         out: list[Attachment] = []
         if msg.photo:
             data = await self._download(msg.photo[-1])
@@ -285,18 +318,10 @@ class TelegramAdapter(BaseAdapter):
                 )
         if msg.sticker:
             st = msg.sticker
-            if st.is_animated or st.is_video:
-                if st.thumbnail is not None:
-                    data = await self._download(st.thumbnail)
-                    if data is not None:
-                        out.append(
-                            Attachment(
-                                "image",
-                                data=data,
-                                mime="image/jpeg",
-                                filename="sticker.jpg",
-                            )
-                        )
+            if st.is_animated:
+                out.extend(await self._animated(st, "tgs", "sticker"))
+            elif st.is_video:
+                out.extend(await self._animated(st, "webm", "sticker"))
             else:
                 data = await self._download(st)
                 if data is not None:
@@ -308,7 +333,85 @@ class TelegramAdapter(BaseAdapter):
                             filename="sticker.webp",
                         )
                     )
+        if msg.animation:
+            out.extend(await self._animated(msg.animation, "mp4", "animation"))
         return out
+
+    async def _animated(self, obj, fmt: str, label: str) -> list[Attachment]:
+        """Convert one animated Telegram object to a GIF Attachment, falling
+        back to its static thumbnail on any failure. Returns 0 or 1 items."""
+        if fmt == "mp4" and not self._within_gif_limits(obj):
+            return await self._thumbnail(obj, label)
+
+        key = obj.file_unique_id
+        if key in self._anims:
+            self._anims.move_to_end(key)
+            gif = self._anims[key]
+        else:
+            gif = await self._convert(obj, fmt)
+            self._anims[key] = gif
+            self._anims.move_to_end(key)
+            while len(self._anims) > _ANIM_CACHE_MAX:
+                self._anims.popitem(last=False)
+
+        if gif is None:
+            _LOGGER.warning(
+                "[tg] could not animate %s (%s), bridging static thumbnail", label, fmt
+            )
+            return await self._thumbnail(obj, label)
+        return [
+            Attachment("image", data=gif, mime="image/gif", filename=f"{label}.gif")
+        ]
+
+    async def _convert(self, obj, fmt: str) -> bytes | None:
+        data = await self._download(obj)
+        if data is None:
+            return None
+        if fmt == "tgs":
+            gif = await media.tgs_to_gif(data)
+        else:
+            gif = await media.video_to_gif(data, fmt)
+        if gif is None:
+            return None
+        # Sanity-check what came back rather than trusting the exit code: a
+        # single-frame result is worse than the thumbnail (it costs bandwidth
+        # and still doesn't move), and an oversized one would overrun QQ's image
+        # limits and bloat the base64 payload on the QQ transport.
+        if len(gif) > _ANIM_MAX_OUTPUT_BYTES:
+            _LOGGER.warning("[tg] converted %s is %d bytes, too large", fmt, len(gif))
+            return None
+        if not media.is_animated_image(gif):
+            _LOGGER.warning("[tg] converted %s came back with a single frame", fmt)
+            return None
+        return gif
+
+    @staticmethod
+    def _within_gif_limits(anim) -> bool:
+        """A Telegram GIF is an arbitrary silent MP4; only convert short, small
+        ones (see `_GIF_MAX_SECONDS` / `_GIF_MAX_BYTES`)."""
+        size = getattr(anim, "file_size", None)
+        if size is not None and size > _GIF_MAX_BYTES:
+            return False
+        duration = getattr(anim, "duration", None)
+        if isinstance(duration, datetime.timedelta):
+            duration = duration.total_seconds()
+        return not (duration is not None and duration > _GIF_MAX_SECONDS)
+
+    async def _thumbnail(self, obj, label: str) -> list[Attachment]:
+        """The static-frame fallback: whatever preview Telegram already has.
+
+        The mime is sniffed rather than assumed: a Telegram sticker thumbnail is
+        WEBP *or* JPEG, and mislabelling a WEBP as JPEG makes Matrix clients
+        refuse to render it."""
+        thumb = getattr(obj, "thumbnail", None)
+        if thumb is None:
+            return []
+        data = await self._download(thumb)
+        if data is None:
+            return []
+        mime = sniff_image_mime(data) or "image/jpeg"
+        ext = {"image/webp": "webp", "image/png": "png"}.get(mime, "jpg")
+        return [Attachment("image", data=data, mime=mime, filename=f"{label}.{ext}")]
 
     @staticmethod
     def _media_src(att: Attachment):
@@ -373,9 +476,28 @@ class TelegramAdapter(BaseAdapter):
         # Whichever media leg goes first carries the caption and the reply; every
         # produced id is returned (in order, first = reply anchor) so the Router
         # links each one.
+        #
+        # Images are walked in source order and consecutive stills are batched
+        # into albums, but an animation always goes out alone: `sendMediaGroup`
+        # only accepts photo/video/audio/document, so an animation physically
+        # cannot ride in an album. Partitioning stills from animations instead
+        # would be simpler but would reorder the sender's images.
         ids: list[str] = []
-        if images:
-            ids.extend(await self._send_images(images, caption, entities, reply_id))
+        for animated, group in itertools.groupby(images, key=self._is_animated):
+            run = list(group)
+            if animated:
+                for att in run:
+                    ids.append(
+                        await self._send_animation(
+                            att, caption, entities, reply_id, first=not ids
+                        )
+                    )
+            else:
+                ids.extend(
+                    await self._send_images(
+                        run, caption, entities, reply_id, first=not ids
+                    )
+                )
         for audio in audios:
             ids.append(
                 await self._send_audio(
@@ -384,22 +506,48 @@ class TelegramAdapter(BaseAdapter):
             )
         return ids
 
+    @staticmethod
+    def _is_animated(att: Attachment) -> bool:
+        """Whether this image has to go out via `send_animation`.
+
+        `send_photo` re-encodes its input into a static JPEG, so a GIF sent that
+        way arrives frozen. Two narrowing conditions:
+
+        * The format must be GIF. `sendAnimation` takes only GIF or silent MP4,
+          so an animated WebP or APNG (a QQ `mface` can be either) would be
+          rejected outright — losing the message. Those keep going through
+          `send_photo`: still, as today, but delivered.
+        * Within GIF the call is made on the bytes, not the mime, because a
+          *still* GIF pushed through `send_animation` becomes an animation
+          bubble that cannot play. A url-only attachment has no bytes to
+          inspect, so there the mime is all there is to go on."""
+        mime = att.mime or sniff_image_mime(att.data)
+        if mime != "image/gif":
+            return False
+        if att.data is None:
+            return True
+        return media.is_animated_image(att.data)
+
     async def _send_images(
         self,
         images: list[Attachment],
         caption: str,
         entities: list[MessageEntity],
         reply_id: int | None,
+        *,
+        first: bool,
     ) -> list[str]:
+        """Send a run of still images. `first` means this run opens the whole
+        outbound message, so it owns the caption and the reply anchor."""
         assert self._app is not None
         bot = self._app.bot
         if len(images) == 1:
             sent = await bot.send_photo(
                 chat_id=self.chat_id,
                 photo=self._media_src(images[0]),
-                caption=caption,
-                caption_entities=entities,
-                reply_to_message_id=reply_id,
+                caption=caption if first else None,
+                caption_entities=entities if first else None,
+                reply_to_message_id=reply_id if first else None,
             )
             return [str(sent.message_id)]
 
@@ -408,23 +556,44 @@ class TelegramAdapter(BaseAdapter):
         ids: list[str] = []
         for batch_start in range(0, len(images), _MEDIA_GROUP_MAX):
             batch = images[batch_start : batch_start + _MEDIA_GROUP_MAX]
-            media = [
+            leads = first and batch_start == 0
+            group = [
                 InputMediaPhoto(
                     media=self._media_src(img),
-                    caption=caption if (batch_start == 0 and i == 0) else None,
-                    caption_entities=entities
-                    if (batch_start == 0 and i == 0)
-                    else None,
+                    caption=caption if (leads and i == 0) else None,
+                    caption_entities=entities if (leads and i == 0) else None,
                 )
                 for i, img in enumerate(batch)
             ]
             sent_msgs = await bot.send_media_group(
                 chat_id=self.chat_id,
-                media=media,
-                reply_to_message_id=reply_id if batch_start == 0 else None,
+                media=group,
+                reply_to_message_id=reply_id if leads else None,
             )
             ids.extend(str(m.message_id) for m in sent_msgs)
         return ids
+
+    async def _send_animation(
+        self,
+        att: Attachment,
+        caption: str,
+        entities: list[MessageEntity],
+        reply_id: int | None,
+        *,
+        first: bool,
+    ) -> str:
+        """Send one animated image. `send_animation` rather than `send_photo`:
+        the latter re-encodes to a static JPEG and kills the animation."""
+        assert self._app is not None
+        sent = await self._app.bot.send_animation(
+            chat_id=self.chat_id,
+            animation=self._media_src(att),
+            filename=att.filename or "animation.gif",
+            caption=caption if first else None,
+            caption_entities=entities if first else None,
+            reply_to_message_id=reply_id if first else None,
+        )
+        return str(sent.message_id)
 
     async def _send_audio(
         self,

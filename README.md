@@ -29,6 +29,7 @@ Matrix ────┘   msg-in → fan → msg-out └── mautrix appservice
 | QQ | 另一台机器上跑 NapCat + 配套的 `tri-lug-qq-relay`（本仓库不含 relay）；API 见 <https://napneko.github.io/api/4.18.13> |
 | RabbitMQ | 本机 broker，QQ 侧 relay 远程连入（relay 侧建议 mTLS）；两边都是主动外连 |
 | Matrix | 由 homeserver 管理员注册 appservice，拿到 `as_token`/`hs_token`，并把反代指向本进程的监听端口 |
+| 动图转换 | `lottieconverter` + `ffmpeg`，devShell 已自带。缺失不会导致启动失败：TG 动态贴纸/GIF 会降级成静态缩略图 |
 
 三端可以分别开关（`TG_ENABLED` / `QQ_ENABLED` / `MATRIX_ENABLED`）：关掉的一端会换成只打日志的 MockAdapter，所以可以先只跑通一端。
 

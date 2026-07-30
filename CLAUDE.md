@@ -52,6 +52,8 @@ Staleness is checked **only at the fan handoff**, never again in msg-out (the pa
 ### Neutral message model (`bridge_message.py`)
 Adapters translate platform events into `BridgeMessage` (text + ordered `Attachment[]` + `BridgeUser` sender + `reply_to_msg_id`) on the way in and render it back out. `msg_id`/`reply_to_msg_id` are always the **origin platform's** native ids; the Router resolves replies to the target's id via the IdMap before calling `send`. Stickers are normalized to `kind="image"`. `sniff_image_mime` exists because mautrix won't auto-detect MIME without libmagic.
 
+**Animated media** (`media.py`) is converted to a single 256px GIF on the TG **inbound** path — deliberately before the fan, since `_fan` hands the *same* `BridgeMessage` object to every target, so one conversion serves both and no adapter has to mutate shared state. It shells out to `lottieconverter`/`ffmpeg` (in the devShell) and degrades to the sticker's static thumbnail on any failure, so a host without those binaries still bridges. Results are cached by `file_unique_id`, failures included. Outbound to TG, animated images must go via `send_animation`: `send_photo` re-encodes to a static JPEG, which was the original "GIFs don't move" bug.
+
 ### Adapters (`adapters.py` + per-platform files)
 `BaseAdapter` defines `send` (outbound render) and `_emit` (inbound → `Router.submit`). One adapter owns one platform's side of one room.
 - **`TelegramAdapter`** (`tg_adapter.py`) — driven by antares-bot's handler dispatch via `on_update`.

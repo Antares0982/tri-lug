@@ -5,7 +5,7 @@
 * Three-way message interop (messages flow between all three platforms).
 * Messages from the bridge's own bot accounts are never forwarded to other group chats under any circumstances.
 * Forwarding is split into two independent queue stages: msg-in (inbound, order-preserving) and msg-out (outbound, rate-limited), with a fan distributing between them.
-* Every message is timestamped at the moment it is first received: QQ is stamped by the relay on inbound (before entering RabbitMQ); TG/Matrix are stamped by their respective adapter when the event is received.
+* Every message is timestamped at the moment it is first received: QQ is stamped by the relay on inbound (before entering RabbitMQ); TG/Matrix are stamped by their respective adapter when it builds the `BridgeMessage`. Note that "builds" is *after* media has been downloaded and (for TG animations) converted, so that work is not charged against the staleness budget below.
 * msg-in: one queue per source, guaranteeing messages from the same source reach the fan in send order, so a later message never overtakes an earlier one (assuming low message frequency).
 * At the fan -> msg-out handoff the timestamp is checked: if it differs from the current time by more than 60 seconds the message is dropped and a WARNING is logged (purpose: drop stale messages that lingered in RabbitMQ or were badly delayed by network jitter). Once in msg-out no further timeout check is done (the delay introduced by the 3-second rate limit does not count).
 * msg-out: one queue per target; consecutive actually-sent messages to the same target are spaced at least 3 seconds apart.
@@ -45,15 +45,26 @@
   - The relay maintains a disk cache keyed by QQ image file id; every hour it removes files older than 3 hours.
 - Must correctly handle all combinations of image and text (including linked text) mixed together, multiple images in one message, etc. The normalized model uses `text:str + ordered attachments[]`: on inbound, merge all text and collect all images (the exact interleaving of text/images is not preserved). On outbound rendering:
   - QQ: `[reply] + text segment + each image segment`.
-  - TG: a single image uses `send_photo` with header+text as its caption; several images use a `send_media_group` album with the caption on the first item, split into batches of 10 (only the first batch carries the caption and the reply).
+  - TG: images are walked in source order and split by whether they are *animated* (see below). A run of stills uses `send_photo` when alone, or a `send_media_group` album in batches of 10; each animated image goes out alone via `send_animation`.
   - Matrix: send one text event first (only if there is text), then one event per image.
-  - Reply mapping: `adapter.send` returns **every** native id it produced and the Router links all of them into the same logical message, so a reply pointing at any part resolves. The first returned id is the reply anchor.
+  - Reply mapping: `adapter.send` returns **every** native id it produced and the Router links all of them into the same logical message, so a reply pointing at any part resolves. The first returned id is the reply anchor. Whichever leg goes out **first** owns the caption and the `reply_to_message_id`; every later leg is bare.
+- **Animated images -> TG must use `send_animation`.** `sendPhoto` re-encodes its input into a static JPEG, so a GIF pushed through it arrives frozen. Two conditions gate the choice:
+  - The format must be **GIF**. `sendAnimation` accepts only GIF or silent MP4, so an animated WebP or APNG (a QQ `mface` can be either) would be rejected outright and the message lost — those deliberately keep going through `send_photo`: still, but delivered. **This is a known gap**; closing it would need an *outbound* ffmpeg hop, which cuts against doing all conversion on the TG inbound path.
+  - Within GIF the call is made on the **bytes** (`media.is_animated_image` walks the GIF/APNG/WebP block structure), not the mime: a *still* GIF sent via `sendAnimation` becomes an animation bubble that will not play. Only a url-only attachment, whose bytes alice never sees, falls back to trusting `mime == "image/gif"`.
+  - An animation can never ride in an album: `sendMediaGroup` accepts only photo/video/audio/document. Hence the run-grouping above rather than a simpler stills/animations partition, which would reorder the sender's images.
 - The relay must fetch and inline bytes for both `image` and `mface` segments (`face`, the small yellow-face emoji, is not fetched and is dropped by alice). Fetch order: first HTTP GET the url in the segment; on failure or no url, fall back to NapCat `get_image`/`get_file` to read the local cache file.
 - TG inbound albums (multiple images sharing a `media_group_id`, arriving as separate Updates, exactly one of them carrying the caption): buffer by `media_group_id` for 1 second, then merge into a single message (ordered by `message_id`; the lowest one supplies the msg id and the reply target, whichever item has the caption supplies the text) before handing off to the fan.
 - Matrix inbound captions follow MSC2530: a captioned image carries the real file name in `filename` and the caption in `body`/`formatted_body`; an uncaptioned one has no `filename` and its `body` *is* the file name (so it is not treated as text).
 
 ### Stickers (always normalized to images)
-- **TG sticker**: static webp -> use directly as an image; **animated/video sticker -> take the `sticker.thumbnail` static frame**, do not touch lottie/gif conversion.
+- **TG sticker**: static webp -> use directly as an image. **Animated (`.tgs`, gzipped Lottie) and video (`.webm`) stickers are converted to an animated GIF on alice**, on the TG *inbound* path, before the message reaches the Router.
+  - One target format (256px GIF, 25fps) for both destinations, because it is the only moving format QQ and Matrix both render natively. Converting once on inbound also means the single `BridgeMessage` the fan hands to every target already carries the finished bytes — no adapter mutates shared state, and no work is done twice.
+  - Conversion is done by `modules/tri_lug_utils/media.py`, shelling out to `lottieconverter` (`.tgs`, after a stdlib gunzip) or `ffmpeg` (`.webm`). Both binaries come from the devShell (`shell.nix`); **they must exist on the machine running the bot**.
+  - Results are cached by `file_unique_id` (Telegram's stable content key), capped at 128 entries. **Failures are cached too** — a sticker that will not convert should not cost a subprocess every time it is posted.
+  - **Any failure degrades to the old behaviour: the static `sticker.thumbnail` frame**, plus one WARNING. Missing binary, non-zero exit, timeout, or an undownloadable file all take this path. Animated media never costs the message.
+  - Conversion latency does **not** eat the §1 staleness budget: `BridgeMessage.ts` is stamped when the message is *built*, which happens after attachment extraction returns, so the 60s check at the fan never sees it. It does not block the Router either — `Router.submit` is a synchronous `put_nowait` downstream of conversion.
+  - What it does affect is **inbound ordering**: python-telegram-bot dispatches handlers concurrently, so a message whose sticker takes seconds to convert can be overtaken by a plain text message posted after it. This race is pre-existing (any slow media download does the same) but conversion widens the window; the 20s timeout, the 2-way concurrency cap, and the cache are what bound it. A reorder buffer keyed on a receive sequence number is the fix if this ever actually bites — deliberately not done yet.
+- **TG GIF** (`msg.animation`, actually a silent MP4) -> converted to GIF by the same path, but only when it is under **10 seconds and 5 MB**. Over either limit the static thumbnail is bridged instead: a long MP4 makes an enormous GIF, which is slow to produce, overruns QQ's image limits, and bloats the base64 payload on the QQ transport.
 - **QQ `mface`** (large store emoji) -> handled exactly like an `image` segment (relay-inlined bytes, falling back to the url).
 - **QQ `face`** (small yellow face) -> dropped entirely; there is no name map, so a placeholder would just be noise. A message whose only segments are `face` therefore parses to nothing and is dropped silently.
 - **Matrix `m.sticker`** -> already an image, treat as an image.
@@ -98,7 +109,7 @@
 
 ### Other messages
 
-- Messages outside the v1 scope (video/file, unrecognized cards, TG/Matrix voice, etc.) are not forwarded. (QQ voice *is* forwarded — see Voice notes above.)
+- Messages outside the v1 scope (video/file, unrecognized cards, TG/Matrix voice, etc.) are not forwarded. (QQ voice *is* forwarded — see Voice notes above; TG GIFs *are* forwarded, as converted animations — see Stickers above.)
 - The log annotation is a **QQ-side feature only**: a group event that parses to nothing bridgeable is dropped after one WARNING `[QQ][log-only · not forwarded] <type + segment/notice summary>`. alice does the annotating rather than flagging it in the RabbitMQ payload, because the relay does no translation and cannot tell whether something is bridgeable.
   - Exception — **noise types are dropped silently, without any log line**: the `group_msg_emoji_like` and `group_recall` notices, `sub_type=poke`, and messages whose segments are all `face`. These recur often enough that logging them is pure spam.
 - TG and Matrix have no equivalent annotation: an event with no bridgeable content is dropped silently on those sides.

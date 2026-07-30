@@ -43,6 +43,52 @@ def _strip_pika_log_handlers() -> None:
 _strip_pika_log_handlers()
 
 
+def gif_bytes(frames: int = 1) -> bytes:
+    """A structurally valid GIF with `frames` image descriptors.
+
+    Hand-built rather than generated with an image library so the suite stays
+    dependency-free, and so the *structure* (not just a magic-byte prefix) is
+    what `media.is_animated_image` gets to walk. The pixel data is a real 1x1
+    LZW stream, but nothing here has to decode — only parse."""
+    header = b"GIF89a" if frames > 1 else b"GIF87a"
+    # Logical screen descriptor: 1x1, no global colour table.
+    out = [header, b"\x01\x00\x01\x00\x00\x00\x00"]
+    for _ in range(frames):
+        if frames > 1:
+            # Graphic control extension (delay), only meaningful when animating.
+            out.append(b"\x21\xf9\x04\x00\x0a\x00\x00\x00")
+        # Image descriptor: 1x1 at 0,0, no local colour table.
+        out.append(b"\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00")
+        # LZW minimum code size, one sub-block, block terminator.
+        out.append(b"\x02\x02\x4c\x01\x00")
+    out.append(b"\x3b")  # trailer
+    return b"".join(out)
+
+
+def _png_chunk(ctype: bytes, payload: bytes) -> bytes:
+    return len(payload).to_bytes(4, "big") + ctype + payload + b"\x00\x00\x00\x00"
+
+
+def png_bytes(*, animated: bool = False) -> bytes:
+    """A PNG, optionally an APNG (an `acTL` chunk ahead of the first `IDAT`).
+    CRCs are zeroed — the detector parses chunk framing, it does not verify."""
+    out = [b"\x89PNG\r\n\x1a\n", _png_chunk(b"IHDR", b"\x00" * 13)]
+    if animated:
+        out.append(_png_chunk(b"acTL", b"\x00" * 8))
+    out.append(_png_chunk(b"IDAT", b"\x00" * 4))
+    return b"".join(out)
+
+
+def webp_bytes(*, animated: bool = False) -> bytes:
+    """A RIFF/WEBP file; when animated, an extended `VP8X` header with the
+    ANIMATION flag (0x02) set."""
+    if animated:
+        body = b"VP8X" + (10).to_bytes(4, "little") + b"\x02" + b"\x00" * 9
+    else:
+        body = b"VP8 " + (8).to_bytes(4, "little") + b"\x00" * 8
+    return b"RIFF" + (len(body) + 4).to_bytes(4, "little") + b"WEBP" + body
+
+
 class FakeQQTransport(QQTransport):
     """Records action calls and hands back a synthetic message_id."""
 

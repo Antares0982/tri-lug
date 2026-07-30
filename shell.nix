@@ -25,7 +25,14 @@ let
       ;
   };
   internalShell = mkShell {
-    packages = [ pyenv ];
+    packages = [
+      pyenv
+      # Animated-sticker / GIF conversion, shelled out to by
+      # modules/tri_lug_utils/media.py. Absent, animated media silently
+      # degrades to a static thumbnail.
+      pkgs.ffmpeg
+      pkgs.lottieconverter
+    ];
   };
 in
 internalShell.overrideAttrs {
