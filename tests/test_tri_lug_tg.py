@@ -20,6 +20,7 @@ Covers:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 
 import pytest
@@ -47,6 +48,9 @@ HEADER_U16_LEN = 10  # "[QQ] " 5 + 小明 2 + 🎉 2 (surrogate pair) + ":" 1
 @dataclass
 class _Sent:
     message_id: int
+    # Only meaningful on a send_animation reply: Telegram leaves it unset when it
+    # declines to treat the upload as an animation and files it as a document.
+    animation: object | None = None
 
 
 @dataclass
@@ -54,6 +58,8 @@ class _FakeBot:
     id: int = 1
     calls: list[tuple[str, dict]] = field(default_factory=list)
     _next_id: int = 100
+    # Flip to False to emulate Telegram filing an animation as a document.
+    animation_accepted: bool = True
 
     def _record(self, name: str, kwargs: dict, count: int = 1):
         self.calls.append((name, kwargs))
@@ -76,7 +82,10 @@ class _FakeBot:
         return self._record("send_media_group", kw, count=len(kw["media"]))
 
     async def send_animation(self, **kw):
-        return self._record("send_animation", kw)[0]
+        sent = self._record("send_animation", kw)[0]
+        if self.animation_accepted:
+            sent.animation = object()
+        return sent
 
 
 @dataclass
@@ -203,6 +212,39 @@ async def test_animated_gif_uses_send_animation():
     assert kw["caption"] == f"{HEADER}\nwiggle"
     assert kw["reply_to_message_id"] == 7
     _assert_header_bold(kw["caption_entities"])
+
+
+async def test_animation_filename_ignores_the_source_name():
+    """Telegram picks the media type off the upload's filename extension, so a
+    GIF handed over under NapCat's `<hash>.image` name comes back as a document
+    bubble. The extension is derived from what the bytes are, not from what the
+    source called them."""
+    adapter, bot = _adapter()
+    msg = _message(
+        "",
+        [
+            Attachment(
+                "image",
+                data=ANIMATED,
+                mime="image/gif",
+                filename="A1B2C3D4E5F6.image",
+            )
+        ],
+    )
+    await adapter.send(msg, reply_to_native_id=None)
+    assert bot.calls[0][1]["filename"] == "animation.gif", bot.calls
+
+
+async def test_document_reply_is_logged(caplog):
+    """Telegram converts GIF -> MP4 itself and may decline. That still delivers,
+    so it must not raise — but nothing else would surface it."""
+    adapter, bot = _adapter()
+    bot.animation_accepted = False
+    msg = _message("", [Attachment("image", data=ANIMATED, mime="image/gif")])
+    with caplog.at_level(logging.WARNING):
+        ids = await adapter.send(msg, reply_to_native_id=None)
+    assert ids == ["101"], ids
+    assert "will show as a file" in caplog.text
 
 
 async def test_still_gif_still_uses_send_photo():

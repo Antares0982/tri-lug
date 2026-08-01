@@ -588,11 +588,30 @@ class TelegramAdapter(BaseAdapter):
         sent = await self._app.bot.send_animation(
             chat_id=self.chat_id,
             animation=self._media_src(att),
-            filename=att.filename or "animation.gif",
+            # NOT `att.filename`. Telegram picks the media type off the upload's
+            # filename extension, and the source name rarely has a usable one:
+            # NapCat names its files after a content hash (`<hash>.image`, or no
+            # extension at all) and a Matrix event may only carry `body`. Given
+            # anything but `.gif`/`.mp4` here, `sendAnimation` degrades to a
+            # document and the animation arrives as a file bubble. `_is_animated`
+            # has already proven these bytes are an animated GIF, so the
+            # extension is established fact, not a guess.
+            filename="animation.gif",
             caption=caption if first else None,
             caption_entities=entities if first else None,
             reply_to_message_id=reply_id if first else None,
         )
+        if getattr(sent, "animation", None) is None:
+            # Telegram accepted the upload but declined to treat it as an
+            # animation (it converts GIF -> MP4 server-side and can refuse).
+            # Delivered, but as a file bubble — worth a line, since nothing else
+            # surfaces it.
+            _LOGGER.warning(
+                "[tg] send_animation produced a non-animation message (%s bytes,"
+                " %s); it will show as a file",
+                len(att.data) if att.data is not None else "url",
+                att.mime,
+            )
         return str(sent.message_id)
 
     async def _send_audio(
