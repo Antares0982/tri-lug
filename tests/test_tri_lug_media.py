@@ -11,7 +11,7 @@ wherever they are used (see tests/test_tri_lug_tg.py).
 
 from __future__ import annotations
 
-from modules.tri_lug_utils.media import is_animated_image
+from modules.tri_lug_utils.media import describe_gif, is_animated_image
 
 from conftest import gif_bytes, png_bytes, webp_bytes
 
@@ -57,3 +57,16 @@ def test_truncated_gif_does_not_hang_or_raise():
     full = gif_bytes(frames=3)
     for cut in (5, 13, 20, len(full) - 1):
         assert is_animated_image(full[:cut]) in (True, False)
+
+
+def test_describe_gif_reports_geometry_and_frames():
+    """Diagnostic for the one case nothing else explains: Telegram accepting a
+    GIF but filing it as a document. Geometry and frame count are what make
+    those refusals recognizable as a pattern."""
+    assert describe_gif(gif_bytes(frames=3)) == "1x1, 3 frames"
+
+
+def test_describe_gif_ignores_non_gifs():
+    assert describe_gif(png_bytes(animated=True)) == ""
+    assert describe_gif(b"") == ""
+    assert describe_gif(None) == ""

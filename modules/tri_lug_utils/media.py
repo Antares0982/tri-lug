@@ -76,13 +76,19 @@ def is_animated_image(data: bytes | None) -> bool:
 
 
 def _gif_is_animated(data: bytes) -> bool:
-    """Walk the GIF block stream and stop as soon as a second image descriptor
-    turns up. Layout: 6-byte header, 7-byte logical screen descriptor, optional
-    global colour table, then a stream of extension (0x21) / image (0x2C)
-    blocks terminated by 0x3B."""
+    return _gif_frames(data, stop_at=2) > 1
+
+
+def _gif_frames(data: bytes, stop_at: int | None = None) -> int:
+    """Count the image descriptors in a GIF's block stream. Layout: 6-byte
+    header, 7-byte logical screen descriptor, optional global colour table, then
+    a stream of extension (0x21) / image (0x2C) blocks terminated by 0x3B.
+
+    `stop_at` bounds the walk: the animated-or-not question only ever needs to
+    see two, and stopping there keeps the check O(first two frames)."""
     n = len(data)
     if n < 13:
-        return False
+        return 0
     packed = data[10]
     pos = 13
     if packed & 0x80:  # global colour table present
@@ -97,17 +103,32 @@ def _gif_is_animated(data: bytes) -> bool:
             pos = _skip_gif_sub_blocks(data, pos)
         elif marker == 0x2C:  # image descriptor: marker + 8 bytes + packed
             frames += 1
-            if frames > 1:
-                return True
+            if stop_at is not None and frames >= stop_at:
+                return frames
             pos += 10
             local = data[pos - 1]
             if local & 0x80:  # local colour table present
                 pos += 3 * (1 << ((local & 0x07) + 1))
             pos += 1  # LZW minimum code size
             pos = _skip_gif_sub_blocks(data, pos)
-        else:  # malformed; don't guess
-            return False
-    return frames > 1
+        else:  # malformed; don't guess further
+            break
+    return frames
+
+
+def describe_gif(data: bytes | None) -> str:
+    """`WxH, N frames` for a GIF payload, empty string for anything else.
+
+    Diagnostic only, and only used on a rare warning path: when Telegram accepts
+    a GIF but declines to treat it as an animation, the geometry and the frame
+    count are the two things that make the pattern identifiable (Telegram
+    converts GIF -> MP4 itself and refuses some inputs — very small ones in
+    particular)."""
+    if not data or data[:6] not in (b"GIF87a", b"GIF89a") or len(data) < 13:
+        return ""
+    width = int.from_bytes(data[6:8], "little")
+    height = int.from_bytes(data[8:10], "little")
+    return f"{width}x{height}, {_gif_frames(data)} frames"
 
 
 def _skip_gif_sub_blocks(data: bytes, pos: int) -> int:

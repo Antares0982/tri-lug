@@ -5,7 +5,8 @@ stickers and GIFs (all normalized to image; animated ones are converted to an
 animated GIF locally, see `media.py`), replies, and albums (media groups, which
 arrive as several Updates sharing a `media_group_id` and are reassembled into
 one message). Outbound: text, single photo, a media-group album, an animation,
-or audio (a bridged QQ voice note).
+a document (an image too big to go as a photo), or audio (a bridged QQ voice
+note).
 
 The `[label] name:` header is bolded via an explicit `MessageEntity` rather than
 a parse_mode, so the body after it is never scanned for markup and needs no
@@ -23,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from telegram import InputMediaPhoto, MessageEntity
+from telegram.error import BadRequest, TimedOut
 
 from antares_bot.bot_logging import get_logger
 
@@ -70,6 +72,25 @@ _GIF_MAX_BYTES = 5 * 1024 * 1024
 # Ceiling on what a conversion may *produce*. A GIF past this would overrun QQ's
 # image limits and bloat the base64 payload on the QQ transport.
 _ANIM_MAX_OUTPUT_BYTES = 8 * 1024 * 1024
+
+# Telegram rejects a `sendPhoto` upload over 10 MB outright ("File of size N
+# bytes is too big for a photo"). Bigger images go out as documents instead —
+# a file bubble, but the picture is delivered and at full resolution.
+_PHOTO_MAX_BYTES = 10 * 1024 * 1024
+
+# Bot API upload ceiling for a document. Past this nothing can be sent.
+_DOCUMENT_MAX_BYTES = 50 * 1024 * 1024
+
+# Timeouts for outbound media calls. python-telegram-bot defaults to 5s, which
+# is a timeout on Telegram's *reply* — and Telegram answers a media upload only
+# after it has ingested (and, for a GIF, re-encoded) the file, which routinely
+# takes longer than that. The default therefore fires on pictures that were in
+# fact delivered fine, so media sends get a much longer leash.
+_MEDIA_TIMEOUTS = {
+    "connect_timeout": 20.0,
+    "read_timeout": 60.0,
+    "write_timeout": 60.0,
+}
 
 
 @dataclass
@@ -465,46 +486,89 @@ class TelegramAdapter(BaseAdapter):
         ]
 
         if not images and not audios:
-            sent = await self._app.bot.send_message(
-                chat_id=self.chat_id,
-                text=caption,
-                entities=entities,
-                reply_to_message_id=reply_id,
+            sent = await self._await_sent(
+                "send_message",
+                self._app.bot.send_message(
+                    chat_id=self.chat_id,
+                    text=caption,
+                    entities=entities,
+                    reply_to_message_id=reply_id,
+                ),
             )
-            return [str(sent.message_id)]
+            return [str(m.message_id) for m in sent]
 
         # Whichever media leg goes first carries the caption and the reply; every
         # produced id is returned (in order, first = reply anchor) so the Router
-        # links each one.
+        # links each one. `first` is tracked explicitly rather than inferred from
+        # `not ids`: a leg that timed out contributes no id even though it was
+        # very likely delivered, and the next leg must not then repeat the header
+        # and the reply anchor.
         #
-        # Images are walked in source order and consecutive stills are batched
-        # into albums, but an animation always goes out alone: `sendMediaGroup`
-        # only accepts photo/video/audio/document, so an animation physically
-        # cannot ride in an album. Partitioning stills from animations instead
-        # would be simpler but would reorder the sender's images.
+        # Images are walked in source order and consecutive ones needing the same
+        # sender are batched, but only stills can actually share a call: an
+        # animation goes out alone because `sendMediaGroup` only accepts
+        # photo/video/audio/document, and an oversized image goes out alone as a
+        # document. Partitioning by mode instead of grouping runs would be
+        # simpler but would reorder the sender's images.
         ids: list[str] = []
-        for animated, group in itertools.groupby(images, key=self._is_animated):
+        first = True
+        for mode, group in itertools.groupby(images, key=self._image_mode):
             run = list(group)
-            if animated:
-                for att in run:
-                    ids.append(
-                        await self._send_animation(
-                            att, caption, entities, reply_id, first=not ids
-                        )
-                    )
-            else:
+            if mode == "photo":
                 ids.extend(
                     await self._send_images(
-                        run, caption, entities, reply_id, first=not ids
+                        run, caption, entities, reply_id, first=first
                     )
                 )
+                first = False
+                continue
+            send = self._send_animation if mode == "animation" else self._send_document
+            for att in run:
+                ids.extend(await send(att, caption, entities, reply_id, first=first))
+                first = False
         for audio in audios:
-            ids.append(
-                await self._send_audio(
-                    audio, caption, entities, reply_id, first=not ids
-                )
+            ids.extend(
+                await self._send_audio(audio, caption, entities, reply_id, first=first)
             )
+            first = False
         return ids
+
+    @staticmethod
+    async def _await_sent(what: str, call) -> list["Message"]:
+        """Await one outbound Bot call and normalize its result to a list of
+        Messages, turning a response timeout into a WARNING and an empty list.
+
+        A `TimedOut` here means Telegram did not answer in time, *not* that it
+        did not deliver — the upload has already gone up the wire, and in
+        practice the message shows up in the chat. The design forbids a retry
+        (which would double-post), so the only thing actually lost is the native
+        id, i.e. this message can't be a reply target from another platform.
+        That is a warning, not the failed-delivery traceback the Router would
+        otherwise log — and letting it through would also abandon the remaining
+        legs of a multi-image message."""
+        try:
+            sent = await call
+        except TimedOut:
+            _LOGGER.warning(
+                "[tg] %s timed out waiting for Telegram's reply; the message was"
+                " most likely delivered, but its id is unknown so replies to it"
+                " will not map",
+                what,
+            )
+            return []
+        return list(sent) if isinstance(sent, (list, tuple)) else [sent]
+
+    @classmethod
+    def _image_mode(cls, att: Attachment) -> str:
+        """Which sender this image needs: `animation`, `document` or `photo`.
+
+        The animation question is asked first: `sendAnimation` takes files up to
+        50 MB, so a big GIF has no reason to lose its motion to the photo cap."""
+        if cls._is_animated(att):
+            return "animation"
+        if att.data is not None and len(att.data) > _PHOTO_MAX_BYTES:
+            return "document"
+        return "photo"
 
     @staticmethod
     def _is_animated(att: Attachment) -> bool:
@@ -542,14 +606,33 @@ class TelegramAdapter(BaseAdapter):
         assert self._app is not None
         bot = self._app.bot
         if len(images) == 1:
-            sent = await bot.send_photo(
-                chat_id=self.chat_id,
-                photo=self._media_src(images[0]),
-                caption=caption if first else None,
-                caption_entities=entities if first else None,
-                reply_to_message_id=reply_id if first else None,
-            )
-            return [str(sent.message_id)]
+            try:
+                sent = await self._await_sent(
+                    "send_photo",
+                    bot.send_photo(
+                        chat_id=self.chat_id,
+                        photo=self._media_src(images[0]),
+                        caption=caption if first else None,
+                        caption_entities=entities if first else None,
+                        reply_to_message_id=reply_id if first else None,
+                        **_MEDIA_TIMEOUTS,
+                    ),
+                )
+            except BadRequest as err:
+                # Backstop for what `_image_mode` cannot see coming: a url-only
+                # attachment has no bytes to measure, and Telegram also rejects
+                # photos on dimensions, not just size. Nothing was delivered, so
+                # resending as a document is safe.
+                if not self._photo_rejected(err):
+                    raise
+                _LOGGER.warning(
+                    "[tg] Telegram refused the photo (%s); resending as a document",
+                    err.message,
+                )
+                return await self._send_document(
+                    images[0], caption, entities, reply_id, first=first
+                )
+            return [str(m.message_id) for m in sent]
 
         # Multiple images -> media-group album(s); caption on the first item.
         # The first batch carries the reply + caption.
@@ -565,13 +648,77 @@ class TelegramAdapter(BaseAdapter):
                 )
                 for i, img in enumerate(batch)
             ]
-            sent_msgs = await bot.send_media_group(
-                chat_id=self.chat_id,
-                media=group,
-                reply_to_message_id=reply_id if leads else None,
+            sent_msgs = await self._await_sent(
+                "send_media_group",
+                bot.send_media_group(
+                    chat_id=self.chat_id,
+                    media=group,
+                    reply_to_message_id=reply_id if leads else None,
+                    **_MEDIA_TIMEOUTS,
+                ),
             )
             ids.extend(str(m.message_id) for m in sent_msgs)
         return ids
+
+    @staticmethod
+    def _photo_rejected(err: BadRequest) -> bool:
+        """Whether this BadRequest is Telegram declining the upload *as a photo*
+        specifically — i.e. resending it as a document would work. Anything else
+        (a stale reply target, a lost chat) must keep propagating."""
+        msg = (err.message or "").lower()
+        return (
+            "too big for a photo" in msg
+            or "photo_invalid_dimensions" in msg
+            or "photo dimensions" in msg
+            or "image_process_failed" in msg
+        )
+
+    async def _send_document(
+        self,
+        att: Attachment,
+        caption: str,
+        entities: list[MessageEntity],
+        reply_id: int | None,
+        *,
+        first: bool,
+    ) -> list[str]:
+        """Send one image as a file, for pictures Telegram won't take as photos.
+
+        It arrives as a file bubble rather than inline, but at full resolution
+        and un-re-encoded, which beats not arriving at all."""
+        assert self._app is not None
+        if att.data is not None and len(att.data) > _DOCUMENT_MAX_BYTES:
+            _LOGGER.warning(
+                "[tg] dropping a %d-byte image: past the %d-byte upload limit",
+                len(att.data),
+                _DOCUMENT_MAX_BYTES,
+            )
+            return []
+        sent = await self._await_sent(
+            "send_document",
+            self._app.bot.send_document(
+                chat_id=self.chat_id,
+                document=self._media_src(att),
+                # Derived from the bytes, not `att.filename`, for the same reason
+                # as the animation path below: the source name is typically a
+                # NapCat content hash with no usable extension, and the client
+                # picks its preview off the extension.
+                filename=self._document_name(att),
+                caption=caption if first else None,
+                caption_entities=entities if first else None,
+                reply_to_message_id=reply_id if first else None,
+                **_MEDIA_TIMEOUTS,
+            ),
+        )
+        return [str(m.message_id) for m in sent]
+
+    @staticmethod
+    def _document_name(att: Attachment) -> str:
+        mime = att.mime or sniff_image_mime(att.data) or "image/jpeg"
+        ext = {"image/png": "png", "image/gif": "gif", "image/webp": "webp"}.get(
+            mime, "jpg"
+        )
+        return f"image.{ext}"
 
     async def _send_animation(
         self,
@@ -581,38 +728,46 @@ class TelegramAdapter(BaseAdapter):
         reply_id: int | None,
         *,
         first: bool,
-    ) -> str:
+    ) -> list[str]:
         """Send one animated image. `send_animation` rather than `send_photo`:
         the latter re-encodes to a static JPEG and kills the animation."""
         assert self._app is not None
-        sent = await self._app.bot.send_animation(
-            chat_id=self.chat_id,
-            animation=self._media_src(att),
-            # NOT `att.filename`. Telegram picks the media type off the upload's
-            # filename extension, and the source name rarely has a usable one:
-            # NapCat names its files after a content hash (`<hash>.image`, or no
-            # extension at all) and a Matrix event may only carry `body`. Given
-            # anything but `.gif`/`.mp4` here, `sendAnimation` degrades to a
-            # document and the animation arrives as a file bubble. `_is_animated`
-            # has already proven these bytes are an animated GIF, so the
-            # extension is established fact, not a guess.
-            filename="animation.gif",
-            caption=caption if first else None,
-            caption_entities=entities if first else None,
-            reply_to_message_id=reply_id if first else None,
+        sent = await self._await_sent(
+            "send_animation",
+            self._app.bot.send_animation(
+                chat_id=self.chat_id,
+                animation=self._media_src(att),
+                # NOT `att.filename`. Telegram picks the media type off the
+                # upload's filename extension, and the source name rarely has a
+                # usable one: NapCat names its files after a content hash
+                # (`<hash>.image`, or no extension at all) and a Matrix event may
+                # only carry `body`. Given anything but `.gif`/`.mp4` here,
+                # `sendAnimation` degrades to a document and the animation
+                # arrives as a file bubble. `_is_animated` has already proven
+                # these bytes are an animated GIF, so the extension is
+                # established fact, not a guess.
+                filename="animation.gif",
+                caption=caption if first else None,
+                caption_entities=entities if first else None,
+                reply_to_message_id=reply_id if first else None,
+                **_MEDIA_TIMEOUTS,
+            ),
         )
-        if getattr(sent, "animation", None) is None:
+        if sent and getattr(sent[0], "animation", None) is None:
             # Telegram accepted the upload but declined to treat it as an
-            # animation (it converts GIF -> MP4 server-side and can refuse).
-            # Delivered, but as a file bubble — worth a line, since nothing else
-            # surfaces it.
+            # animation (it converts GIF -> MP4 server-side and can refuse —
+            # notably for very small ones). Delivered, but as a file bubble —
+            # worth a line, since nothing else surfaces it. The geometry and
+            # frame count are logged because they are what makes a pattern in
+            # these refusals identifiable.
             _LOGGER.warning(
                 "[tg] send_animation produced a non-animation message (%s bytes,"
-                " %s); it will show as a file",
+                " %s%s); it will show as a file",
                 len(att.data) if att.data is not None else "url",
                 att.mime,
+                f", {summary}" if (summary := media.describe_gif(att.data)) else "",
             )
-        return str(sent.message_id)
+        return [str(m.message_id) for m in sent]
 
     async def _send_audio(
         self,
@@ -622,17 +777,21 @@ class TelegramAdapter(BaseAdapter):
         reply_id: int | None,
         *,
         first: bool,
-    ) -> str:
+    ) -> list[str]:
         """Send one audio attachment (a bridged QQ voice note, transcoded to mp3
         by the relay). `send_audio` rather than `send_voice`: the latter only
         accepts OGG/OPUS and rejects everything else."""
         assert self._app is not None
-        sent = await self._app.bot.send_audio(
-            chat_id=self.chat_id,
-            audio=self._media_src(audio),
-            filename=audio.filename or "voice.mp3",
-            caption=caption if first else None,
-            caption_entities=entities if first else None,
-            reply_to_message_id=reply_id if first else None,
+        sent = await self._await_sent(
+            "send_audio",
+            self._app.bot.send_audio(
+                chat_id=self.chat_id,
+                audio=self._media_src(audio),
+                filename=audio.filename or "voice.mp3",
+                caption=caption if first else None,
+                caption_entities=entities if first else None,
+                reply_to_message_id=reply_id if first else None,
+                **_MEDIA_TIMEOUTS,
+            ),
         )
-        return str(sent.message_id)
+        return [str(m.message_id) for m in sent]

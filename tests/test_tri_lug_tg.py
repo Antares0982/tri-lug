@@ -14,7 +14,9 @@ Covers:
   3. a bridged QQ voice note goes out via send_audio, not send_voice
   4. outbound: animated images go via send_animation (send_photo would freeze
      them), still images keep their album batching, and source order survives
-  5. inbound: animated/video stickers and GIFs are converted once, cached by
+  5. outbound: an image past Telegram's 10 MB photo cap goes as a document, and
+     a slow Telegram reply is a warning rather than a failed delivery
+  6. inbound: animated/video stickers and GIFs are converted once, cached by
      file_unique_id, and degrade to a static thumbnail on any failure
 """
 
@@ -25,6 +27,7 @@ from dataclasses import dataclass, field
 
 import pytest
 from telegram import MessageEntity
+from telegram.error import BadRequest, TimedOut
 
 from modules.tri_lug_utils import media
 from modules.tri_lug_utils.bridge_message import (
@@ -60,9 +63,15 @@ class _FakeBot:
     _next_id: int = 100
     # Flip to False to emulate Telegram filing an animation as a document.
     animation_accepted: bool = True
+    # method name -> exception raised (once) instead of sending, for the paths
+    # that only exist to handle a Telegram refusal or a slow reply.
+    raises: dict[str, Exception] = field(default_factory=dict)
 
     def _record(self, name: str, kwargs: dict, count: int = 1):
         self.calls.append((name, kwargs))
+        err = self.raises.pop(name, None)
+        if err is not None:
+            raise err
         sent = []
         for _ in range(count):
             self._next_id += 1
@@ -77,6 +86,9 @@ class _FakeBot:
 
     async def send_audio(self, **kw):
         return self._record("send_audio", kw)[0]
+
+    async def send_document(self, **kw):
+        return self._record("send_document", kw)[0]
 
     async def send_media_group(self, **kw):
         return self._record("send_media_group", kw, count=len(kw["media"]))
@@ -339,6 +351,141 @@ async def test_animation_leading_album_leaves_album_uncaptioned():
     group_kw = bot.calls[1][1]
     assert all(m.caption is None for m in group_kw["media"])
     assert group_kw["reply_to_message_id"] is None
+
+
+# ------------------------------------------------ outbound: oversized pictures
+OVERSIZED = b"\xff\xd8\xff" + b"\x00" * (10 * 1024 * 1024)
+
+
+async def test_oversized_image_goes_out_as_a_document():
+    """Telegram rejects a photo over 10 MB outright ("File of size N bytes is
+    too big for a photo"). A document arrives as a file bubble, but it arrives."""
+    adapter, bot = _adapter()
+    msg = _message("big", [Attachment("image", data=OVERSIZED, mime="image/jpeg")])
+    ids = await adapter.send(msg, reply_to_native_id="7")
+    assert ids == ["101"], ids
+    assert [c[0] for c in bot.calls] == ["send_document"], bot.calls
+    kw = bot.calls[0][1]
+    assert kw["document"] == OVERSIZED
+    assert kw["filename"] == "image.jpg"  # derived from the mime, not the source
+    assert kw["caption"] == f"{HEADER}\nbig"
+    assert kw["reply_to_message_id"] == 7
+
+
+async def test_oversized_image_does_not_break_run_order():
+    """The document leg is just another mode in the run-grouping: the stills
+    around it still batch, and the sender's order survives."""
+    adapter, bot = _adapter()
+    msg = _message(
+        "",
+        [
+            Attachment("image", data=b"a", mime="image/png"),
+            Attachment("image", data=OVERSIZED, mime="image/jpeg"),
+            Attachment("image", data=b"b", mime="image/png"),
+        ],
+    )
+    ids = await adapter.send(msg, reply_to_native_id=None)
+    assert [c[0] for c in bot.calls] == [
+        "send_photo",
+        "send_document",
+        "send_photo",
+    ], bot.calls
+    assert len(ids) == 3, ids
+
+
+async def test_animated_gif_over_the_photo_cap_stays_an_animation():
+    """sendAnimation's own limit is 50 MB, so a big GIF has no reason to give up
+    its motion for the photo cap."""
+    adapter, bot = _adapter()
+    big_gif = ANIMATED + b"\x00" * (10 * 1024 * 1024)
+    msg = _message("", [Attachment("image", data=big_gif, mime="image/gif")])
+    await adapter.send(msg, reply_to_native_id=None)
+    assert [c[0] for c in bot.calls] == ["send_animation"], bot.calls
+
+
+async def test_photo_refusal_falls_back_to_a_document(caplog):
+    """A url-only attachment has no bytes to measure up front, and Telegram also
+    refuses photos on dimensions — so the refusal itself is a second trigger."""
+    adapter, bot = _adapter()
+    bot.raises["send_photo"] = BadRequest(
+        "File of size 11380792 bytes is too big for a photo;"
+        " the maximum size is 10485760 bytes"
+    )
+    msg = _message("x", [Attachment("image", url="http://x/a.jpg", mime="image/jpeg")])
+    with caplog.at_level(logging.WARNING):
+        ids = await adapter.send(msg, reply_to_native_id="3")
+    assert [c[0] for c in bot.calls] == ["send_photo", "send_document"], bot.calls
+    assert ids == ["101"], ids  # only the document actually produced a message
+    assert "resending as a document" in caplog.text
+    doc_kw = bot.calls[1][1]
+    assert doc_kw["caption"] == f"{HEADER}\nx"  # still the leading leg
+    assert doc_kw["reply_to_message_id"] == 3
+
+
+async def test_unrelated_bad_request_still_propagates():
+    """Only a refusal of the photo *as a photo* is retried; anything else (a
+    stale reply target, a lost chat) must keep surfacing."""
+    adapter, bot = _adapter()
+    bot.raises["send_photo"] = BadRequest("Replied message not found")
+    msg = _message("", [Attachment("image", data=b"\x89PNG", mime="image/png")])
+    with pytest.raises(BadRequest):
+        await adapter.send(msg, reply_to_native_id="9")
+
+
+async def test_oversized_beyond_the_upload_limit_is_dropped(caplog):
+    adapter, bot = _adapter()
+    huge = b"\xff\xd8\xff" + b"\x00" * (50 * 1024 * 1024)
+    msg = _message("", [Attachment("image", data=huge, mime="image/jpeg")])
+    with caplog.at_level(logging.WARNING):
+        ids = await adapter.send(msg, reply_to_native_id=None)
+    assert bot.calls == []
+    assert ids == []
+    assert "upload limit" in caplog.text
+
+
+# ------------------------------------------------------- outbound: send timeouts
+async def test_media_sends_get_a_long_read_timeout():
+    """PTB's 5s default is a timeout on Telegram's *reply*, which for a media
+    upload only comes after Telegram has ingested (and re-encoded) the file."""
+    adapter, bot = _adapter()
+    msg = _message("", [Attachment("image", data=ANIMATED, mime="image/gif")])
+    await adapter.send(msg, reply_to_native_id=None)
+    assert bot.calls[0][1]["read_timeout"] >= 30
+
+
+async def test_send_timeout_is_a_warning_not_a_failed_delivery(caplog):
+    """A TimedOut means Telegram did not *answer* in time, not that it did not
+    deliver: the picture shows up in the chat. Raising here would have the
+    Router log a delivery-failed traceback for a message that went through."""
+    adapter, bot = _adapter()
+    bot.raises["send_photo"] = TimedOut()
+    msg = _message("hi", [Attachment("image", data=b"\x89PNG", mime="image/png")])
+    with caplog.at_level(logging.WARNING):
+        ids = await adapter.send(msg, reply_to_native_id=None)
+    assert ids == []  # nothing to link: the native id never came back
+    assert "timed out" in caplog.text
+
+
+async def test_timeout_does_not_hand_the_caption_to_the_next_leg(caplog):
+    """The lead leg is tracked explicitly, not inferred from "no ids yet": a
+    timed-out first image was still delivered, so repeating the header and the
+    reply anchor on the second one would double them in the chat."""
+    adapter, bot = _adapter()
+    bot.raises["send_animation"] = TimedOut()
+    msg = _message(
+        "lead",
+        [
+            Attachment("image", data=ANIMATED, mime="image/gif"),
+            Attachment("image", data=STILL, mime="image/gif"),
+        ],
+    )
+    with caplog.at_level(logging.WARNING):
+        ids = await adapter.send(msg, reply_to_native_id="42")
+    assert [c[0] for c in bot.calls] == ["send_animation", "send_photo"], bot.calls
+    assert ids == ["101"], ids
+    photo_kw = bot.calls[1][1]
+    assert photo_kw["caption"] is None
+    assert photo_kw["reply_to_message_id"] is None
 
 
 # ---------------------------------------------------------- inbound: stickers
