@@ -122,27 +122,26 @@ def parse_group_event(
 
 
 def _image_attachment(data: dict) -> Attachment | None:
-    """Build an image Attachment from an OneBot image/mface segment. The relay
-    inlines the fetched bytes as ``base64``; fall back to a url/file ref only if
-    no bytes were provided (so a bridge still degrades gracefully)."""
+    """Build an image Attachment from an OneBot image/mface segment.
+
+    Only the bytes the relay inlined as ``base64`` are usable. There is no
+    url/file fallback: the relay reaches this state *because* its own HTTP GET
+    of that same url already failed (QQ image urls carry an `rkey` that expires,
+    and go 400 outright when NapCat's rkey source is down), so handing the url
+    downstream just moves a guaranteed failure into the target adapter — where
+    it costs the whole message instead of one log line. A segment without bytes
+    yields None and takes the log-only path."""
     b64 = data.get("base64")
-    if b64:
-        try:
-            raw_bytes = base64.b64decode(b64)
-        except ValueError:
-            raw_bytes = b""
-        if raw_bytes:
-            mime = data.get("mime") or sniff_image_mime(raw_bytes)
-            return Attachment(
-                "image",
-                data=raw_bytes,
-                mime=mime,
-                filename=data.get("file"),
-            )
-    file_ref = data.get("url") or data.get("file")
-    if file_ref:
-        return Attachment("image", url=file_ref, filename=data.get("file"))
-    return None
+    if not b64:
+        return None
+    try:
+        raw_bytes = base64.b64decode(b64)
+    except ValueError:
+        return None
+    if not raw_bytes:
+        return None
+    mime = data.get("mime") or sniff_image_mime(raw_bytes)
+    return Attachment("image", data=raw_bytes, mime=mime, filename=data.get("file"))
 
 
 # The relay asks NapCat to transcode voice notes to mp3; the mime is still read

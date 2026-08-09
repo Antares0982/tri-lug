@@ -81,8 +81,22 @@ def test_parse_rich_event():
             {"type": "reply", "data": {"id": "111"}},
             {"type": "at", "data": {"qq": "456", "name": "Bob"}},
             {"type": "text", "data": {"text": "hi there"}},
-            {"type": "image", "data": {"url": "https://x/a.jpg", "file": "a.jpg"}},
-            {"type": "mface", "data": {"url": "https://x/s.png", "summary": "[doge]"}},
+            {
+                "type": "image",
+                "data": {
+                    "url": "https://x/a.jpg",
+                    "file": "a.jpg",
+                    "base64": base64.b64encode(b"\x89PNG-a").decode(),
+                },
+            },
+            {
+                "type": "mface",
+                "data": {
+                    "url": "https://x/s.png",
+                    "summary": "[doge]",
+                    "base64": base64.b64encode(b"\x89PNG-s").decode(),
+                },
+            },
             {"type": "face", "data": {"id": "178"}},
         ]
     )
@@ -94,6 +108,18 @@ def test_parse_rich_event():
     assert bm.mentions == ["456"], bm.mentions
     assert len(bm.attachments) == 2 and all(a.kind == "image" for a in bm.attachments)
     assert bm.sender.display_name == "GroupAlice"
+
+
+def test_image_without_bytes_is_not_forwarded():
+    """The relay only omits `base64` after its own GET of that url failed, so a
+    url-only segment is a known-dead url: it yields no attachment, and an
+    image-only message parses to nothing (the log-only path)."""
+    seg = {"type": "image", "data": {"url": "https://x/a.jpg", "file": "a.jpg"}}
+    assert parse_group_event(make_group_event([seg]), ROOM) is None
+    bm = parse_group_event(
+        make_group_event([{"type": "text", "data": {"text": "look"}}, seg]), ROOM
+    )
+    assert bm is not None and bm.text == "look" and bm.attachments == []
 
 
 def test_parse_rejects():
