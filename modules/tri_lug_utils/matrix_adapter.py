@@ -23,7 +23,7 @@ from typing import cast
 
 import aiohttp
 from mautrix.appservice import AppService, IntentAPI
-from mautrix.errors import MatrixError
+from mautrix.errors import MatrixError, MatrixRequestError
 from mautrix.types import (
     AudioInfo,
     ContentURI,
@@ -57,6 +57,20 @@ _LOGGER = get_logger(__name__)
 
 # Suffix on ghost display names so identical names across platforms stay distinct.
 _PLATFORM_LABEL = {"tg": "TG", "qq": "QQ", "matrix": "Matrix"}
+
+# Homeserver-side hiccups: a 5xx from the server, a rate limit, or a Cloudflare
+# 52x in front of it (the 522 body is a page of HTML, which is what makes the
+# Router's traceback unreadable).
+_TRANSIENT_STATUS = frozenset({408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524})
+
+
+def _is_transient(exc: Exception) -> bool:
+    """Whether an outbound failure is the homeserver being briefly unreachable
+    rather than a bug in the bridge — the difference between a one-line WARNING
+    here and the Router's full traceback."""
+    if isinstance(exc, MatrixRequestError):
+        return getattr(exc, "http_status", 0) in _TRANSIENT_STATUS
+    return isinstance(exc, (aiohttp.ClientError, TimeoutError))
 
 
 class _HtmlToText(HTMLParser):
@@ -387,45 +401,70 @@ class MatrixAdapter(BaseAdapter):
     ) -> list[str]:
         if self._appserv is None:
             return []
-        intent = await self._ghost_intent(msg.sender)
         reply_evt = EventID(reply_to_native_id) if reply_to_native_id else None
         # A text + image source message splits into a text event and an image
         # event; both ids are returned so the Router links each one, otherwise a
         # reply to the image event resolves to nothing.
         event_ids: list[str] = []
 
-        if msg.text:
-            content = TextMessageEventContent(msgtype=MessageType.TEXT, body=msg.text)
-            if reply_evt:
-                content.set_reply(reply_evt)
-            event_ids.append(str(await intent.send_message(self._room_id, content)))
+        # A homeserver that is briefly unreachable is not a bridge bug: the
+        # message is lost either way (a retry could double-post, since a 522
+        # cannot tell us whether the event landed), so report it as one WARNING
+        # line rather than letting the Router log a traceback whose payload is a
+        # Cloudflare error page. Ids collected before the failure are still
+        # returned so the legs that did land stay linked.
+        try:
+            intent = await self._ghost_intent(msg.sender)
 
-        for att in msg.attachments:
-            if att.kind not in ("image", "audio"):
-                continue
-            data = await self._attachment_bytes(att)
-            if data is None:
-                continue
-            is_audio = att.kind == "audio"
-            # Audio always carries its mime from the source (the relay names the
-            # transcoded format); only images need sniffing, since mautrix can't
-            # auto-detect without libmagic.
-            mime = att.mime or (None if is_audio else sniff_image_mime(data))
-            mxc = await intent.upload_media(data, mime_type=mime, filename=att.filename)
-            info = None
-            if mime:
-                info = (
-                    AudioInfo(mimetype=mime) if is_audio else ImageInfo(mimetype=mime)
+            if msg.text:
+                content = TextMessageEventContent(
+                    msgtype=MessageType.TEXT, body=msg.text
                 )
-            content = MediaMessageEventContent(
-                msgtype=MessageType.AUDIO if is_audio else MessageType.IMAGE,
-                body=att.filename or ("voice" if is_audio else "image"),
-                url=mxc,
-                info=info,
+                if reply_evt:
+                    content.set_reply(reply_evt)
+                event_ids.append(str(await intent.send_message(self._room_id, content)))
+
+            for att in msg.attachments:
+                if att.kind not in ("image", "audio"):
+                    continue
+                data = await self._attachment_bytes(att)
+                if data is None:
+                    continue
+                is_audio = att.kind == "audio"
+                # Audio always carries its mime from the source (the relay names
+                # the transcoded format); only images need sniffing, since
+                # mautrix can't auto-detect without libmagic.
+                mime = att.mime or (None if is_audio else sniff_image_mime(data))
+                mxc = await intent.upload_media(
+                    data, mime_type=mime, filename=att.filename
+                )
+                info = None
+                if mime:
+                    info = (
+                        AudioInfo(mimetype=mime)
+                        if is_audio
+                        else ImageInfo(mimetype=mime)
+                    )
+                content = MediaMessageEventContent(
+                    msgtype=MessageType.AUDIO if is_audio else MessageType.IMAGE,
+                    body=att.filename or ("voice" if is_audio else "image"),
+                    url=mxc,
+                    info=info,
+                )
+                if reply_evt and not event_ids:
+                    content.set_reply(reply_evt)
+                event_ids.append(str(await intent.send_message(self._room_id, content)))
+        except Exception as exc:
+            if not _is_transient(exc):
+                raise
+            _LOGGER.warning(
+                "[matrix.send] homeserver unavailable (%s: %s), message from"
+                " [%s] %s not delivered",
+                type(exc).__name__,
+                getattr(exc, "http_status", "") or exc,
+                msg.platform,
+                msg.sender.display_name,
             )
-            if reply_evt and not event_ids:
-                content.set_reply(reply_evt)
-            event_ids.append(str(await intent.send_message(self._room_id, content)))
 
         return event_ids
 
