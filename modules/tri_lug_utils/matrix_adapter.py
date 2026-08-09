@@ -18,6 +18,7 @@ authored by our bot or a ghost (namespace prefix).
 
 from __future__ import annotations
 
+import asyncio
 from html.parser import HTMLParser
 from typing import cast
 
@@ -62,6 +63,10 @@ _PLATFORM_LABEL = {"tg": "TG", "qq": "QQ", "matrix": "Matrix"}
 # 52x in front of it (the 522 body is a page of HTML, which is what makes the
 # Router's traceback unreadable).
 _TRANSIENT_STATUS = frozenset({408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524})
+
+# How long to wait before retrying the homeserver-side startup (registration,
+# alias resolution, pin baseline) while the homeserver is unreachable.
+_SETUP_RETRY_SECONDS = 60
 
 
 def _is_transient(exc: Exception) -> bool:
@@ -162,6 +167,7 @@ class MatrixAdapter(BaseAdapter):
         self._listen_port = listen_port
         self._appserv: AppService | None = None
         self._http: aiohttp.ClientSession | None = None
+        self._setup_task: asyncio.Task | None = None
         self._ensured_ghosts: set[str] = set()
         # ghost localpart -> last displayname / last mirrored avatar key, so a
         # renamed or re-avatared source user is reflected instead of being
@@ -187,44 +193,70 @@ class MatrixAdapter(BaseAdapter):
         )
         self._appserv.matrix_event_handler(self._on_matrix_event)
         await self._appserv.start(self._listen_host, self._listen_port)
-        await self._appserv.intent.ensure_registered()
-        self._room_id = await self._resolve_room_id(self._room_id)
-        try:
-            await self._appserv.intent.ensure_joined(self._room_id)
-        except MatrixError:
-            _LOGGER.warning(
-                "[matrix] bot not in room %s yet — invite @%s:%s",
-                self._room_id,
-                self._bot_localpart,
-                self._server_name,
-            )
-        self._pinned = await self._current_pins()
         _LOGGER.info(
             "[matrix] appservice listening on %s:%s",
             self._listen_host,
             self._listen_port,
         )
+        # Everything that needs the homeserver reachable happens off to the
+        # side: an unreachable homeserver must not abort the whole bridge's
+        # startup (post_init awaits every adapter's start), and it must not
+        # leave a half-set-up Matrix side behind once it recovers.
+        self._setup_task = asyncio.create_task(self._setup_homeserver())
 
-    async def _resolve_room_id(self, room: RoomID) -> RoomID:
-        """Accept either a `!internal:server` id or a `#alias:server` in config.
-        Aliases are resolved once at startup to the canonical room id, since
-        send_message/ensure_joined require the `!` form."""
+    async def _setup_homeserver(self) -> None:
+        """Register the bot, resolve the configured room alias to its `!id`
+        (send_message/ensure_joined need the `!` form) and read the pin baseline
+        so pre-existing pins aren't seen as fresh.
+
+        Retried while the homeserver is merely unreachable — giving up would
+        leave `_room_id` as an unresolved alias, which silently breaks every
+        later send and every inbound room-id comparison for the whole process.
+        A real error (bad token, unknown alias) stops the retry loop and leaves
+        the Matrix side down without touching the other two platforms."""
         assert self._appserv is not None
-        if not str(room).startswith("#"):
-            return room
-        try:
-            info = await self._appserv.intent.resolve_room_alias(RoomAlias(str(room)))
-            _LOGGER.info("[matrix] resolved alias %s -> %s", room, info.room_id)
-            return info.room_id
-        except MatrixError:
-            _LOGGER.warning(
-                "[matrix] could not resolve alias %s — bridge inbound will not "
-                "work until it resolves to a room id",
-                room,
-            )
-            return room
+        while True:
+            try:
+                await self._appserv.intent.ensure_registered()
+                if str(self._room_id).startswith("#"):
+                    info = await self._appserv.intent.resolve_room_alias(
+                        RoomAlias(str(self._room_id))
+                    )
+                    _LOGGER.info(
+                        "[matrix] resolved alias %s -> %s", self._room_id, info.room_id
+                    )
+                    self._room_id = info.room_id
+                try:
+                    await self._appserv.intent.ensure_joined(self._room_id)
+                except MatrixError as exc:
+                    if _is_transient(exc):
+                        raise
+                    _LOGGER.warning(
+                        "[matrix] bot not in room %s yet — invite @%s:%s",
+                        self._room_id,
+                        self._bot_localpart,
+                        self._server_name,
+                    )
+                self._pinned = await self._current_pins()
+                _LOGGER.info("[matrix] homeserver setup done, room %s", self._room_id)
+                return
+            except Exception as exc:
+                if not _is_transient(exc):
+                    _LOGGER.exception(
+                        "[matrix] homeserver setup failed; the Matrix side stays down"
+                    )
+                    return
+                _LOGGER.warning(
+                    "[matrix] homeserver unavailable (%s: %s), retrying setup in %ss",
+                    type(exc).__name__,
+                    getattr(exc, "http_status", "") or exc,
+                    _SETUP_RETRY_SECONDS,
+                )
+                await asyncio.sleep(_SETUP_RETRY_SECONDS)
 
     async def stop(self) -> None:
+        if self._setup_task is not None:
+            self._setup_task.cancel()
         if self._appserv is not None:
             try:
                 await self._appserv.stop()
@@ -400,6 +432,17 @@ class MatrixAdapter(BaseAdapter):
         self, msg: BridgeMessage, reply_to_native_id: str | None
     ) -> list[str]:
         if self._appserv is None:
+            return []
+        if str(self._room_id).startswith("#"):
+            # `_setup_homeserver` hasn't resolved the alias yet (homeserver down
+            # at startup); sending to an alias would just 400.
+            _LOGGER.warning(
+                "[matrix.send] room %s not resolved yet, message from [%s] %s"
+                " not delivered",
+                self._room_id,
+                msg.platform,
+                msg.sender.display_name,
+            )
             return []
         reply_evt = EventID(reply_to_native_id) if reply_to_native_id else None
         # A text + image source message splits into a text event and an image
