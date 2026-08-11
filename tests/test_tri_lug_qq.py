@@ -24,6 +24,7 @@ from modules.tri_lug_utils.bridge_message import (
 )
 from modules.tri_lug_utils.onebot import (
     build_send_segments,
+    describe_event,
     parse_card_json,
     parse_group_event,
 )
@@ -260,6 +261,66 @@ def test_parse_record_defaults_mime():
     assert bm is not None
     assert bm.attachments[0].mime == "audio/mpeg"
     assert bm.attachments[0].filename == "voice.mp3"
+
+
+def test_parse_video():
+    """A video the relay fetched (and, if it was big, downscaled) becomes a
+    video Attachment."""
+    ev = make_group_event(
+        [
+            {
+                "type": "video",
+                "data": {
+                    "file": "clip.mp4",
+                    "url": "https://x/clip.mp4",  # expired rkey — must be ignored
+                    "file_size": "1048576",
+                    "base64": base64.b64encode(b"\x00\x00\x00\x18ftypmp42").decode(),
+                    "mime": "video/mp4",
+                },
+            }
+        ]
+    )
+    bm = parse_group_event(ev, ROOM)
+    assert bm is not None
+    assert len(bm.attachments) == 1, bm.attachments
+    att = bm.attachments[0]
+    assert att.kind == "video" and att.data == b"\x00\x00\x00\x18ftypmp42"
+    assert att.mime == "video/mp4" and att.filename == "clip.mp4"
+    assert att.url is None, "an expiring QQ url must never be forwarded"
+
+
+def test_parse_video_defaults():
+    """No mime or filename on the segment => mp4, the only thing the relay
+    ever produces."""
+    ev = make_group_event(
+        [{"type": "video", "data": {"base64": base64.b64encode(b"x").decode()}}]
+    )
+    bm = parse_group_event(ev, ROOM)
+    assert bm is not None
+    assert bm.attachments[0].mime == "video/mp4"
+    assert bm.attachments[0].filename == "video.mp4"
+
+
+def test_parse_video_without_bytes_reports_size():
+    """The relay refused it (over its fetch cap, or the transcode failed), so
+    nothing is bridgeable. The log-only line must carry the size, which is the
+    one number that explains the drop."""
+    ev = make_group_event(
+        [
+            {
+                "type": "video",
+                "data": {
+                    "file": "big.mp4",
+                    "url": "https://x/big.mp4",
+                    "file_size": "94107825",
+                },
+            }
+        ]
+    )
+    assert parse_group_event(ev, ROOM) is None
+    described = describe_event(ev)
+    assert "segments=['video']" in described
+    assert "video_bytes=94107825" in described
 
 
 def test_build_segments():

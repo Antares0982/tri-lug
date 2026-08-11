@@ -9,6 +9,8 @@ share card.
 - `image` / `mface` (QQ market sticker) → image Attachment.
 - `record` (QQ voice note) → audio Attachment, but only from the transcoded
   bytes the relay inlines (the raw segment is SILK, which nothing can play).
+- `video` → video Attachment, likewise only from the bytes the relay inlines
+  (it downscales anything big before they cross the broker).
 - `face` (QQ small emoji) → dropped (no name map; would otherwise be noise).
 - `at` → downgraded to plain text `<to:name>`, and the qq id collected in mentions.
 """
@@ -93,6 +95,10 @@ def parse_group_event(
             att = _record_attachment(data)
             if att is not None:
                 attachments.append(att)
+        elif stype == "video":
+            att = _video_attachment(data)
+            if att is not None:
+                attachments.append(att)
         elif stype == "json":
             # QQ share "mini-app" card (bilibili / zhihu / weixin). Rendered to a
             # plain "{title}\n{url}" line; the b23.tv short link it may carry is
@@ -171,6 +177,33 @@ def _record_attachment(data: dict) -> Attachment | None:
     mime = str(data.get("mime") or _RECORD_MIME)
     ext = _RECORD_EXT.get(mime) or mime.rpartition("/")[2] or "bin"
     return Attachment("audio", data=raw_bytes, mime=mime, filename=f"voice.{ext}")
+
+
+_VIDEO_MIME = "video/mp4"
+
+
+def _video_attachment(data: dict) -> Attachment | None:
+    """Build a video Attachment from an OneBot ``video`` segment.
+
+    Same base64-only contract as images and voice notes, for the same reason:
+    the relay only leaves a segment byte-less when its own fetch already failed,
+    so passing the url on just relocates a certain failure into the target
+    adapter. The relay also downscales anything over its wire ceiling before
+    inlining — a QQ video may be up to 100 MB, and these bytes ride base64 in the
+    event payload across the broker."""
+    b64 = data.get("base64")
+    if not b64:
+        return None
+    try:
+        raw_bytes = base64.b64decode(b64)
+    except ValueError:
+        return None
+    if not raw_bytes:
+        return None
+    mime = str(data.get("mime") or _VIDEO_MIME)
+    return Attachment(
+        "video", data=raw_bytes, mime=mime, filename=data.get("file") or "video.mp4"
+    )
 
 
 @dataclass
@@ -298,11 +331,23 @@ def describe_event(event: dict) -> str:
     post_type = event.get("post_type")
     if post_type == "message":
         seg_types = []
+        extra = ""
         msg = event.get("message")
         if isinstance(msg, list):
             seg_types = [str(s.get("type")) for s in msg if isinstance(s, dict)]
+            # A video reaching this path carries no bytes, which almost always
+            # means the relay refused it on size. `file_size` is native OneBot,
+            # so reporting it costs no wire contract and turns an opaque line
+            # into the one number that explains the drop.
+            for seg in msg:
+                if isinstance(seg, dict) and seg.get("type") == "video":
+                    size = (seg.get("data") or {}).get("file_size")
+                    if size:
+                        extra = f" video_bytes={size}"
+                    break
         return (
-            f"message segments={seg_types or '?'} message_id={event.get('message_id')}"
+            f"message segments={seg_types or '?'}{extra}"
+            f" message_id={event.get('message_id')}"
         )
     if post_type == "notice":
         return f"notice notice_type={event.get('notice_type')} sub_type={event.get('sub_type')}"

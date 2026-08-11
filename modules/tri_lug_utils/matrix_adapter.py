@@ -40,6 +40,7 @@ from mautrix.types import (
     RoomPinnedEventsStateEventContent,
     TextMessageEventContent,
     UserID,
+    VideoInfo,
 )
 
 from antares_bot.bot_logging import get_logger
@@ -58,6 +59,14 @@ _LOGGER = get_logger(__name__)
 
 # Suffix on ghost display names so identical names across platforms stay distinct.
 _PLATFORM_LABEL = {"tg": "TG", "qq": "QQ", "matrix": "Matrix"}
+
+# Attachment kind -> (msgtype, info class, body used when the source has no
+# filename). Doubles as the outbound filter: a kind absent here isn't bridged.
+_MEDIA_KINDS = {
+    "image": (MessageType.IMAGE, ImageInfo, "image"),
+    "audio": (MessageType.AUDIO, AudioInfo, "voice"),
+    "video": (MessageType.VIDEO, VideoInfo, "video"),
+}
 
 # Homeserver-side hiccups: a 5xx from the server, a rate limit, or a Cloudflare
 # 52x in front of it (the 522 body is a page of HTML, which is what makes the
@@ -468,31 +477,27 @@ class MatrixAdapter(BaseAdapter):
                 event_ids.append(str(await intent.send_message(self._room_id, content)))
 
             for att in msg.attachments:
-                if att.kind not in ("image", "audio"):
+                spec = _MEDIA_KINDS.get(att.kind)
+                if spec is None:
                     continue
+                msgtype, info_cls, default_body = spec
                 data = await self._attachment_bytes(att)
                 if data is None:
                     continue
-                is_audio = att.kind == "audio"
-                # Audio always carries its mime from the source (the relay names
-                # the transcoded format); only images need sniffing, since
-                # mautrix can't auto-detect without libmagic.
-                mime = att.mime or (None if is_audio else sniff_image_mime(data))
+                # Audio and video always carry their mime from the source (the
+                # relay names the format it transcoded to); only images need
+                # sniffing, since mautrix can't auto-detect without libmagic.
+                mime = att.mime or (
+                    sniff_image_mime(data) if att.kind == "image" else None
+                )
                 mxc = await intent.upload_media(
                     data, mime_type=mime, filename=att.filename
                 )
-                info = None
-                if mime:
-                    info = (
-                        AudioInfo(mimetype=mime)
-                        if is_audio
-                        else ImageInfo(mimetype=mime)
-                    )
                 content = MediaMessageEventContent(
-                    msgtype=MessageType.AUDIO if is_audio else MessageType.IMAGE,
-                    body=att.filename or ("voice" if is_audio else "image"),
+                    msgtype=msgtype,
+                    body=att.filename or default_body,
                     url=mxc,
-                    info=info,
+                    info=info_cls(mimetype=mime) if mime else None,
                 )
                 if reply_evt and not event_ids:
                     content.set_reply(reply_evt)

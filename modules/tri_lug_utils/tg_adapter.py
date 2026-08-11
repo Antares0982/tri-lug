@@ -92,6 +92,12 @@ _MEDIA_TIMEOUTS = {
     "write_timeout": 60.0,
 }
 
+# A bridged QQ video is several MB where an image is a few hundred KB, so the
+# upload itself can outlast the write timeout above. Worth its own leash: a
+# `TimedOut` here costs the native id, and with it the ability to reply to this
+# message from another platform (see `_await_sent`).
+_VIDEO_TIMEOUTS = {**_MEDIA_TIMEOUTS, "write_timeout": 180.0}
+
 
 @dataclass
 class _Album:
@@ -484,8 +490,13 @@ class TelegramAdapter(BaseAdapter):
             for a in msg.attachments
             if a.kind == "audio" and (a.data is not None or a.url)
         ]
+        videos = [
+            a
+            for a in msg.attachments
+            if a.kind == "video" and (a.data is not None or a.url)
+        ]
 
-        if not images and not audios:
+        if not images and not audios and not videos:
             sent = await self._await_sent(
                 "send_message",
                 self._app.bot.send_message(
@@ -526,6 +537,11 @@ class TelegramAdapter(BaseAdapter):
             for att in run:
                 ids.extend(await send(att, caption, entities, reply_id, first=first))
                 first = False
+        for video in videos:
+            ids.extend(
+                await self._send_video(video, caption, entities, reply_id, first=first)
+            )
+            first = False
         for audio in audios:
             ids.extend(
                 await self._send_audio(audio, caption, entities, reply_id, first=first)
@@ -767,6 +783,34 @@ class TelegramAdapter(BaseAdapter):
                 att.mime,
                 f", {summary}" if (summary := media.describe_gif(att.data)) else "",
             )
+        return [str(m.message_id) for m in sent]
+
+    async def _send_video(
+        self,
+        att: Attachment,
+        caption: str,
+        entities: list[MessageEntity],
+        reply_id: int | None,
+        *,
+        first: bool,
+    ) -> list[str]:
+        """Send one video attachment (a bridged QQ video, already downscaled by
+        the relay). `send_video` rather than `send_document`: the latter arrives
+        as a file bubble with no inline player."""
+        assert self._app is not None
+        sent = await self._await_sent(
+            "send_video",
+            self._app.bot.send_video(
+                chat_id=self.chat_id,
+                video=self._media_src(att),
+                filename=att.filename or "video.mp4",
+                supports_streaming=True,
+                caption=caption if first else None,
+                caption_entities=entities if first else None,
+                reply_to_message_id=reply_id if first else None,
+                **_VIDEO_TIMEOUTS,
+            ),
+        )
         return [str(m.message_id) for m in sent]
 
     async def _send_audio(

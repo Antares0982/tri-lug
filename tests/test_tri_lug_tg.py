@@ -87,6 +87,9 @@ class _FakeBot:
     async def send_audio(self, **kw):
         return self._record("send_audio", kw)[0]
 
+    async def send_video(self, **kw):
+        return self._record("send_video", kw)[0]
+
     async def send_document(self, **kw):
         return self._record("send_document", kw)[0]
 
@@ -204,6 +207,47 @@ async def test_image_and_audio_anchor_reply_once():
     assert audio_kw["caption_entities"] is None
     assert audio_kw["reply_to_message_id"] is None
     assert audio_kw["filename"] == "voice.mp3"  # no filename -> default
+
+
+async def test_video_uses_send_video():
+    """A bridged QQ video: send_video, not send_document (which would arrive as
+    a file bubble with no inline player) and not send_animation."""
+    adapter, bot = _adapter()
+    msg = _message(
+        "look",
+        [Attachment("video", data=b"\x00\x00\x00\x18ftypmp42", mime="video/mp4")],
+    )
+    ids = await adapter.send(msg, reply_to_native_id="7")
+    assert ids == ["101"], ids
+    assert [c[0] for c in bot.calls] == ["send_video"], bot.calls
+    kw = bot.calls[0][1]
+    assert kw["video"] == b"\x00\x00\x00\x18ftypmp42"
+    assert kw["filename"] == "video.mp4"  # no filename -> default
+    assert kw["supports_streaming"] is True
+    assert kw["caption"] == f"{HEADER}\nlook"
+    assert kw["reply_to_message_id"] == 7
+    _assert_header_bold(kw["caption_entities"])
+
+
+async def test_image_and_video_anchor_reply_once():
+    """With both present the image leg goes first and owns the caption + reply;
+    the video leg follows bare, and every id is returned for linking."""
+    adapter, bot = _adapter()
+    msg = _message(
+        "mixed",
+        [
+            Attachment("image", data=b"\x89PNG", mime="image/png"),
+            Attachment("video", data=b"ftyp", mime="video/mp4", filename="c.mp4"),
+        ],
+    )
+    ids = await adapter.send(msg, reply_to_native_id="9")
+    assert ids == ["101", "102"], ids
+    assert [c[0] for c in bot.calls] == ["send_photo", "send_video"]
+    video_kw = bot.calls[1][1]
+    assert video_kw["caption"] is None
+    assert video_kw["caption_entities"] is None
+    assert video_kw["reply_to_message_id"] is None
+    assert video_kw["filename"] == "c.mp4"
 
 
 # ------------------------------------------------------- outbound: animation

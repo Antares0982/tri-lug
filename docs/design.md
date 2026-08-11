@@ -79,6 +79,14 @@
 - A segment that reaches alice without `base64` yields no attachment, so a voice-only message parses to nothing and takes the ordinary log-only path (`segments=['record']`). That is the intended degradation when NapCat has no ffmpeg or the action times out — nothing unplayable is ever forwarded.
 - Rendering: TG uses `send_audio` (**not** `send_voice`, which only accepts OGG/OPUS) with the header as caption; Matrix sends an `m.audio` event with an `AudioInfo` mimetype. Since QQ never receives its own messages back, the QQ renderer ignores audio attachments entirely.
 
+### Video (QQ -> TG/Matrix, one-way)
+
+- A QQ video arrives as a `video` segment and is forwarded as a **video attachment**. The reverse direction is out of scope (a Telegram or Matrix video is still dropped on those sides). It is *not* run through the GIF pipeline: that exists to make TG's sticker formats movable on platforms that lack them, and its 256px silent GIF output would be strictly worse than the native video both targets can play.
+- Like images and voice notes, **only the bytes the relay inlines as `base64` are usable** — a segment that arrives without them yields no attachment, so a video-only message takes the log-only path. That line carries the segment's `file_size` (`segments=['video'] video_bytes=…`), which is the one number explaining the drop.
+- **The relay downscales before the bytes ever reach alice.** QQ allows videos up to 100 MB, these ride base64 inside the event payload, and the broker is not on machine B's LAN — so the original would cross that machine's home uplink. At or under `VIDEO_WIRE_MAX_BYTES` (8 MiB) the video is shipped untouched; above it, ffmpeg re-encodes to a 640px long side, x264 crf 30, mono 64k audio. A source over `VIDEO_FETCH_MAX_BYTES` (100 MiB) is never even downloaded, and a transcode that cannot get under the ceiling (or that comes out bigger than it went in) is dropped rather than put on the wire.
+- **Transcoding is the one thing the relay does off its ordered event queue.** Measured on the Pi 5 under normal load, 1080p re-encodes at ~4.3x realtime (`wall ≈ duration × src_fps / 100`), so a 100 MB video costs 15–80 s — far too long to hold the single serial event task. It runs detached instead, one at a time, and that event publishes *after* messages that arrived behind it. The same trade is already made on the TG inbound side, where a slow sticker conversion can be overtaken by a later text message. The relay stamps `ts` at publish rather than receipt, so a video that spent a minute in ffmpeg is not born stale against the Router's 60 s cutoff.
+- Rendering: TG uses `send_video` with `supports_streaming` (not `send_document`, which arrives as a file bubble with no player) and a longer write timeout, since these uploads are megabytes rather than kilobytes; Matrix sends an `m.video` event with a `VideoInfo` mimetype. Since QQ never receives its own messages back, the QQ renderer ignores video attachments entirely.
+
 ### Replies
 - On inbound record `reply_to_msg_id` (origin platform native id); the Router resolves it via the IdMap into the target platform native id.
 - Native replies per platform: TG `reply_to_message_id`; QQ `reply` segment `{id}`;
@@ -112,7 +120,7 @@
 
 ### Other messages
 
-- Messages outside the v1 scope (video/file, unrecognized cards, TG/Matrix voice, etc.) are not forwarded. (QQ voice *is* forwarded — see Voice notes above; TG GIFs *are* forwarded, as converted animations — see Stickers above.)
+- Messages outside the v1 scope (file, unrecognized cards, TG/Matrix voice and video, etc.) are not forwarded. (QQ voice and QQ video *are* forwarded — see Voice notes and Video above; TG GIFs *are* forwarded, as converted animations — see Stickers above.)
 - The log annotation is a **QQ-side feature only**: a group event that parses to nothing bridgeable is dropped after one WARNING `[QQ][log-only · not forwarded] <type + segment/notice summary>`. alice does the annotating rather than flagging it in the RabbitMQ payload, because the relay does no translation and cannot tell whether something is bridgeable.
   - Exception — **noise types are dropped silently, without any log line**: the `group_msg_emoji_like` and `group_recall` notices, `sub_type=poke`, and messages whose segments are all `face`. These recur often enough that logging them is pure spam.
 - TG and Matrix have no equivalent annotation: an event with no bridgeable content is dropped silently on those sides.
