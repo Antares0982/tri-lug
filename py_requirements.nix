@@ -37,12 +37,12 @@ in
     pytest-asyncio # async test support
     (pypkgs.buildPythonPackage rec {
       pname = "opencc";
-      version = "ver.1.2.0";
+      version = "1.2.0";
       pyproject = true;
       src = pkgs.fetchFromGitHub {
         owner = "BYVoid";
         repo = "OpenCC";
-        rev = version;
+        rev = "ver.${version}";
         sha256 = "sha256-T2bl4JVE04/64bLdBj5BB+2G09kDFyLnI+hx23h5q68=";
       };
       nativeBuildInputs = [
@@ -70,6 +70,8 @@ in
       };
       postPatch = "";
       doInstallCheck = false;
+      # pinned to a git commit that still declares 2.0.0.dev0
+      dontCheckPythonMetadata = true;
     })
     (pypkgs.buildPythonPackage rec {
       pname = "PixivPy-Async";
