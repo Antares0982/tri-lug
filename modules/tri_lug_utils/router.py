@@ -239,7 +239,7 @@ class Router:
             try:
                 await self._deliver(adapter, msg)
             except Exception:
-                _LOGGER.exception("[router] %s delivery failed", platform)
+                _LOGGER.warning("[router] %s delivery failed", platform, exc_info=True)
             finally:
                 q.task_done()
 
