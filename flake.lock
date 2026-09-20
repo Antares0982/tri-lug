@@ -7,11 +7,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1787407250,
-        "narHash": "sha256-iI/B0Za+86Tz992qD8/EgLMLjhehPUJ8+SeipOSTkT4=",
+        "lastModified": 1789921579,
+        "narHash": "sha256-LgVizDZiTm2i5HnK24ukFvflYtUvux7eW5svJwryPrk=",
         "owner": "Antares0982",
         "repo": "antares-bot",
-        "rev": "5d5a133cd9ada7f3d20d94f2be80b53eeb2ab6f1",
+        "rev": "9227a5c2de0b64dc8ea1d8f144a1fbfafd1e8b9d",
         "type": "github"
       },
       "original": {
