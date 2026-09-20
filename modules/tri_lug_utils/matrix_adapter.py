@@ -474,6 +474,7 @@ class MatrixAdapter(BaseAdapter):
                 )
                 if reply_evt:
                     content.set_reply(reply_evt)
+                content["m.mentions"] = {}
                 event_ids.append(str(await intent.send_message(self._room_id, content)))
 
             for att in msg.attachments:
@@ -501,6 +502,7 @@ class MatrixAdapter(BaseAdapter):
                 )
                 if reply_evt and not event_ids:
                     content.set_reply(reply_evt)
+                content["m.mentions"] = {}
                 event_ids.append(str(await intent.send_message(self._room_id, content)))
         except Exception as exc:
             if not _is_transient(exc):

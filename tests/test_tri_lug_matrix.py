@@ -121,6 +121,26 @@ async def test_send_before_alias_resolves_is_dropped():
     assert await adapter.send(msg, None) == []
 
 
+async def test_no_outbound_mentions():
+    from modules.tri_lug_utils.bridge_message import BridgeMessage, BridgeUser
+
+    intent = _FakeIntent()
+    adapter = _adapter(intent)
+    adapter._room_id = RoomID("!real:example.org")
+    adapter._ghost_intent = lambda sender: _returns(intent)  # type: ignore[assignment]
+    msg = BridgeMessage(
+        platform="tg",
+        room_key="room",
+        msg_id="1",
+        sender=BridgeUser(platform="tg", user_id="1", display_name="alice"),
+        text="alice is in the message body",
+    )
+
+    await adapter.send(msg, "$reply")
+
+    assert intent.sent[0].serialize()["m.mentions"] == {}
+
+
 async def test_media_kinds_render_to_matching_msgtypes():
     """Each bridgeable attachment kind picks its own msgtype and info class, and
     a kind Matrix has no renderer for is skipped rather than sent as something
@@ -168,6 +188,7 @@ async def test_media_kinds_render_to_matching_msgtypes():
         "AudioInfo",
         "VideoInfo",
     ]
+    assert all(c.serialize()["m.mentions"] == {} for c in intent.sent)
     # The uploads carry the same mimes, so the homeserver stores them right too.
     assert [u[1] for u in intent.uploads] == ["image/png", "audio/mpeg", "video/mp4"]
 
