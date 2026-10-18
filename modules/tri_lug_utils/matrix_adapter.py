@@ -84,7 +84,7 @@ def _is_transient(exc: Exception) -> bool:
     here and the Router's full traceback."""
     if isinstance(exc, MatrixRequestError):
         return getattr(exc, "http_status", 0) in _TRANSIENT_STATUS
-    return isinstance(exc, (aiohttp.ClientError, TimeoutError))
+    return isinstance(exc, (aiohttp.ClientError, TimeoutError, ConnectionResetError))
 
 
 class _HtmlToText(HTMLParser):
